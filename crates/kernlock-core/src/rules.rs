@@ -55,9 +55,19 @@ pub struct CompiledRule {
     pub regex: Regex,
 }
 
-#[derive(Debug, Clone, Default)]
+use std::sync::{Arc, RwLock};
+
+#[derive(Debug, Clone)]
 pub struct RuleEngine {
-    rules: Vec<CompiledRule>,
+    rules: Arc<RwLock<Vec<CompiledRule>>>,
+}
+
+impl Default for RuleEngine {
+    fn default() -> Self {
+        Self {
+            rules: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
 }
 
 impl RuleEngine {
@@ -80,7 +90,32 @@ impl RuleEngine {
             })?;
             compiled.push(CompiledRule { def, regex });
         }
-        Ok(Self { rules: compiled })
+        Ok(Self {
+            rules: Arc::new(RwLock::new(compiled)),
+        })
+    }
+
+    pub fn replace_rules(&self, new_defs: Vec<DetectionRuleDef>) -> Result<(), RuleError> {
+        let mut compiled = Vec::with_capacity(new_defs.len());
+        for def in new_defs {
+            let pattern = if def.case_insensitive {
+                format!("(?i){}", def.pattern)
+            } else {
+                def.pattern.clone()
+            };
+            let regex = Regex::new(&pattern).map_err(|source| RuleError::Regex {
+                rule_id: def.id.clone(),
+                source,
+            })?;
+            compiled.push(CompiledRule { def, regex });
+        }
+
+        let mut guard = self.rules.write().map_err(|_| RuleError::Regex {
+            rule_id: "lock".to_string(),
+            source: regex::Error::Syntax("Lock poisoned".to_string()),
+        })?;
+        *guard = compiled;
+        Ok(())
     }
 
     pub fn builtin() -> Self {
@@ -89,19 +124,26 @@ impl RuleEngine {
     }
 
     pub fn rule_count(&self) -> usize {
-        self.rules.len()
+        self.rules.read().map(|g| g.len()).unwrap_or(0)
     }
 
     pub fn rules(&self) -> Vec<DetectionRuleDef> {
-        self.rules.iter().map(|r| r.def.clone()).collect()
+        self.rules
+            .read()
+            .map(|g| g.iter().map(|r| r.def.clone()).collect())
+            .unwrap_or_default()
     }
 
     pub fn evaluate(&self, target: RuleTarget, input: &str) -> Vec<RuleMatch> {
         if input.is_empty() {
             return Vec::new();
         }
+        let guard = match self.rules.read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
         let mut matches = Vec::new();
-        for rule in &self.rules {
+        for rule in guard.iter() {
             if rule.def.target != target {
                 continue;
             }

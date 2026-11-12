@@ -8,7 +8,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use kernlock_core::{AlertStatus, PolicyConfig, ScanMode, ScanStatus};
+use kernlock_core::{AlertStatus, PolicyConfig, ScanMode, ScanStatus, SignedThreatBundle};
 use kernlock_platform::PlatformError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -168,6 +168,11 @@ pub fn build_router(
         .route("/api/quarantine/:id", delete(delete_quarantine))
         .route("/api/policy", get(get_policy).put(update_policy))
         .route("/api/rules", get(list_rules))
+        .route("/api/definitions/status", get(get_definitions_status))
+        .route(
+            "/api/definitions/update",
+            post(update_definitions_endpoint),
+        )
         .route("/api/report", get(get_report))
         .route("/api/report/markdown", get(get_report_markdown))
         .route_layer(middleware::from_fn_with_state(
@@ -435,4 +440,19 @@ async fn get_report_markdown(
         Ok(report) => Ok(state.engine.format_report_markdown(&report)),
         Err(e) => Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
+}
+
+async fn get_definitions_status(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.engine.definition_status())
+}
+
+async fn update_definitions_endpoint(
+    State(state): State<AppState>,
+    Json(bundle): Json<SignedThreatBundle>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .engine
+        .update_definitions(bundle)
+        .map(Json)
+        .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))
 }

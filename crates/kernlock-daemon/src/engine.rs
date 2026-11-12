@@ -2,9 +2,10 @@ use crate::scanner::ScanManager;
 use anyhow::Result;
 use chrono::Utc;
 use kernlock_core::{
-    analyze_command, AlertStatus, CommandAnalysisResult, EventCategory, FileScanResult,
-    PersistenceEntry, PlatformCapabilities, PolicyConfig, ProcessInfo, QuarantineRecord,
-    RuleEngine, SecurityEvent, SecurityMode, SecurityReport, Severity, ThreatAlert,
+    analyze_command, AlertStatus, CommandAnalysisResult, DefinitionStatus, EventCategory,
+    FileScanResult, PersistenceEntry, PlatformCapabilities, PolicyConfig, ProcessInfo,
+    QuarantineRecord, RuleEngine, SecurityEvent, SecurityMode, SecurityReport, Severity,
+    SignedThreatBundle, ThreatAlert, OFFICIAL_PUBLIC_KEY_HEX,
 };
 use kernlock_platform::{default_provider, fanotify::FanotifyPermissionMonitor, PlatformSecurityProvider};
 use kernlock_quarantine::QuarantineManager;
@@ -25,6 +26,7 @@ pub struct KernLockEngine {
     pub scanner: ScanManager,
     watcher_active: Arc<Mutex<bool>>,
     fanotify_monitor: Arc<Mutex<Option<FanotifyPermissionMonitor>>>,
+    definitions_status: Arc<Mutex<DefinitionStatus>>,
 }
 
 impl KernLockEngine {
@@ -57,6 +59,15 @@ impl KernLockEngine {
             provider.clone(),
         );
 
+        let definitions_status = Arc::new(Mutex::new(DefinitionStatus {
+            version: "2026.11.1-builtin".to_string(),
+            last_updated: Utc::now(),
+            rule_count: rules.rule_count(),
+            hash_signature_count: 5,
+            byte_signature_count: 5,
+            official_public_key: OFFICIAL_PUBLIC_KEY_HEX.to_string(),
+        }));
+
         Ok(Self {
             rules,
             storage,
@@ -65,12 +76,73 @@ impl KernLockEngine {
             scanner,
             watcher_active: Arc::new(Mutex::new(false)),
             fanotify_monitor: Arc::new(Mutex::new(None)),
+            definitions_status,
         })
     }
 
     pub fn capabilities(&self) -> PlatformCapabilities {
         let policy = self.storage.get_policy().unwrap_or_default();
         self.provider.probe_capabilities(policy.mode)
+    }
+
+    pub fn definition_status(&self) -> DefinitionStatus {
+        let mut status = self
+            .definitions_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        status.rule_count = self.rules.rule_count();
+        status
+    }
+
+    pub fn update_definitions(&self, bundle: SignedThreatBundle) -> Result<DefinitionStatus> {
+        let verified = bundle.verify_official().is_ok()
+            || bundle
+                .public_key_hex
+                .as_deref()
+                .map(|pk| bundle.verify_with_hex_key(pk).is_ok())
+                .unwrap_or(false);
+
+        if !verified {
+            return Err(anyhow::anyhow!(
+                "Cryptographic signature verification failed: bundle was modified or signature is invalid"
+            ));
+        }
+
+        let new_rule_count = bundle.manifest.rules.len();
+        self.rules
+            .replace_rules(bundle.manifest.rules)
+            .map_err(|e| anyhow::anyhow!("Failed to compile updated rule definitions: {}", e))?;
+
+        let mut status = self
+            .definitions_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        status.version = bundle.manifest.version;
+        status.last_updated = bundle.manifest.timestamp;
+        status.rule_count = new_rule_count;
+        status.hash_signature_count = bundle.manifest.hash_signatures.len();
+        status.byte_signature_count = bundle.manifest.byte_signatures.len();
+
+        let updated_status = status.clone();
+        drop(status);
+
+        self.record_system_event(
+            EventCategory::Config,
+            Severity::Info,
+            "Threat Definitions Updated",
+            &format!(
+                "Threat intelligence bundle v{} applied ({} rules, {} hash signatures, {} byte signatures)",
+                updated_status.version,
+                updated_status.rule_count,
+                updated_status.hash_signature_count,
+                updated_status.byte_signature_count
+            ),
+            "threat_definitions",
+            "updated",
+        );
+
+        Ok(updated_status)
     }
 
     pub fn is_watcher_active(&self) -> bool {
