@@ -1150,6 +1150,19 @@ fn test_6_fifo_rejection_by_regular_file_reader() {
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("not a regular file"));
 
+        // Calling cross_fs_copy_no_clobber on FIFO must immediately fail with InvalidInput, not block indefinitely
+        let dst_copy = tmp.path().join("fifo_copy.dst");
+        let copy_err = kernlock_quarantine::cross_fs_copy_no_clobber(&fifo_path, &dst_copy, false)
+            .unwrap_err();
+        match copy_err {
+            kernlock_quarantine::MoveError::Io(e) => {
+                assert_eq!(e.kind(), ErrorKind::InvalidInput);
+                assert!(e.to_string().contains("not a regular file"));
+            }
+            other => panic!("Expected MoveError::Io, got {other:?}"),
+        }
+        assert!(!dst_copy.exists());
+
         let _ = fs::remove_file(&fifo_path);
     }
 }
@@ -1379,6 +1392,8 @@ fn test_12_post_unlink_file_still_present() {
     fs::write(&target, b"payload for post unlink still present test").unwrap();
     let rec = qm.quarantine_file(&target, "test threat").unwrap();
 
+    let deleting_path = vault_dir.join(format!(".deleting_{}.locked", rec.id));
+
     let err = qm
         .delete_permanently_with_injection(
             rec.id,
@@ -1395,14 +1410,26 @@ fn test_12_post_unlink_file_still_present() {
             assert!(info
                 .cleanup_error
                 .contains("Staging file still present after remove_file"));
-            assert_eq!(info.stranded_files.len(), 1);
+            assert_eq!(
+                info.stranded_files,
+                vec![deleting_path.display().to_string()]
+            );
         }
         other => panic!("Expected CleanupFailed, got {other:?}"),
     }
 
+    // Genuinely assert that the staging file really remains present on disk
+    assert!(
+        deleting_path.exists(),
+        "Staging file must genuinely remain present on disk after injected unlink"
+    );
+
     // Database record must remain Deleted
     let updated = storage.get_quarantine(rec.id).unwrap();
     assert_eq!(updated.status, QuarantineStatus::Deleted);
+
+    // Clean up stranded file for test hygiene
+    let _ = fs::remove_file(&deleting_path);
 }
 
 #[test]
@@ -1556,18 +1583,106 @@ fn test_17_windows_reparse_point_handle_verification() {
 
     assert_eq!(FILE_FLAG_OPEN_REPARSE_POINT, 2097152);
     assert_eq!(FILE_ATTRIBUTE_REPARSE_POINT, 1024);
+}
 
-    #[cfg(windows)]
-    {
-        // On Windows targets, test symlink or junction rejection
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("target.txt");
-        fs::write(&target, b"target file").unwrap();
-        let link = tmp.path().join("link.txt");
-        if std::os::windows::fs::symlink_file(&target, &link).is_ok() {
-            let err = read_regular_nofollow(&link).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
-            assert!(err.to_string().contains("Refusing to follow"));
-        }
+#[cfg(windows)]
+#[test]
+fn test_windows_reparse_point_rejection_in_read_regular_nofollow() {
+    let tmp = TempDir::new().unwrap();
+    let target_dir = tmp.path().join("target_dir");
+    fs::create_dir(&target_dir).unwrap();
+    let junction_dir = tmp.path().join("junction_link");
+
+    // Create a directory junction using cmd /c mklink /J (unprivileged NTFS reparse point)
+    let status = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            junction_dir.to_str().unwrap(),
+            target_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("Failed to execute mklink command on Windows");
+    assert!(
+        status.success(),
+        "mklink /J must succeed to create NTFS reparse point"
+    );
+
+    // Verify read_regular_nofollow rejects reparse point (junction) with InvalidInput
+    let err = read_regular_nofollow(&junction_dir).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("Refusing to follow reparse point")
+            || err.to_string().contains("not a regular file"),
+        "Unexpected error message: {err}"
+    );
+
+    // Also test file symlink if supported
+    let target_file = tmp.path().join("target.txt");
+    fs::write(&target_file, b"content").unwrap();
+    let file_symlink = tmp.path().join("symlink.txt");
+    if std::os::windows::fs::symlink_file(&target_file, &file_symlink).is_ok() {
+        let err2 = read_regular_nofollow(&file_symlink).unwrap_err();
+        assert_eq!(err2.kind(), ErrorKind::InvalidInput);
+        assert!(err2.to_string().contains("Refusing to follow"));
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn test_windows_reparse_point_rejection_in_cross_fs_copy() {
+    let tmp = TempDir::new().unwrap();
+    let target_dir = tmp.path().join("target_dir");
+    fs::create_dir(&target_dir).unwrap();
+    let junction_dir = tmp.path().join("junction_link");
+
+    let status = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            junction_dir.to_str().unwrap(),
+            target_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("Failed to execute mklink command on Windows");
+    assert!(
+        status.success(),
+        "mklink /J must succeed to create NTFS reparse point"
+    );
+
+    let dst_path = tmp.path().join("copied_junction");
+    let err =
+        kernlock_quarantine::cross_fs_copy_no_clobber(&junction_dir, &dst_path, false).unwrap_err();
+    match err {
+        kernlock_quarantine::MoveError::Io(e) => {
+            assert_eq!(e.kind(), ErrorKind::InvalidInput);
+            assert!(
+                e.to_string().contains("Refusing to copy reparse point")
+                    || e.to_string().contains("not a regular file"),
+                "Unexpected error message: {e}"
+            );
+        }
+        other => panic!("Expected MoveError::Io, got {other:?}"),
+    }
+    assert!(!dst_path.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn test_windows_regular_file_cross_fs_copy() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("normal_src.txt");
+    fs::write(&src, b"windows normal copy payload").unwrap();
+    let dst = tmp.path().join("normal_dst.txt");
+
+    kernlock_quarantine::cross_fs_copy_no_clobber(&src, &dst, false).unwrap();
+
+    assert!(dst.exists());
+    assert_eq!(fs::read(&dst).unwrap(), b"windows normal copy payload");
+    assert!(
+        !src.exists(),
+        "Source must be unlinked after successful copy"
+    );
 }

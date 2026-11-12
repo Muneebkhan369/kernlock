@@ -1172,6 +1172,10 @@ impl QuarantineManager {
                         ErrorKind::PermissionDenied,
                         "injected delete unlink cleanup failure",
                     ))
+                } else if inject == FailureInjection::DeletePostUnlinkFileStillPresent {
+                    // Genuinely simulate an unlink operation that returned Ok(())
+                    // while the staging file actually remains present on disk.
+                    Ok(())
                 } else {
                     fs::remove_file(&deleting_path)
                 };
@@ -1201,9 +1205,6 @@ impl QuarantineManager {
                     FailureInjection::DeletePostUnlinkIoError => Err(io::Error::other(
                         "injected post-unlink metadata I/O failure",
                     )),
-                    FailureInjection::DeletePostUnlinkFileStillPresent => {
-                        fs::symlink_metadata(&self.vault_dir)
-                    }
                     _ => fs::symlink_metadata(&deleting_path),
                 };
 
@@ -2532,7 +2533,7 @@ pub fn cross_fs_copy_no_clobber(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            src_opts.custom_flags(libc::O_NOFOLLOW);
+            src_opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         #[cfg(windows)]
         {
@@ -2540,17 +2541,56 @@ pub fn cross_fs_copy_no_clobber(
             const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
             src_opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let meta = fs::symlink_metadata(src)?;
+            if meta.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Refusing to follow symbolic link: {}", src.display()),
+                ));
+            }
+        }
         let mut src_file = src_opts.open(src)?;
+
+        let meta = src_file.metadata()?;
+        let ft = meta.file_type();
+        if !ft.is_file() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Source is not a regular file (is_dir={}, is_symlink={}, file_type={:?}): {}",
+                    ft.is_dir(),
+                    ft.is_symlink(),
+                    ft,
+                    src.display()
+                ),
+            ));
+        }
+
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;
             const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
-            let meta = src_file.metadata()?;
             if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 return Err(io::Error::new(
                     ErrorKind::InvalidInput,
                     format!("Refusing to copy reparse point: {}", src.display()),
                 ));
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = src_file.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let set_res = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+            if set_res < 0 {
+                return Err(io::Error::last_os_error());
             }
         }
 
