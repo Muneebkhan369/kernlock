@@ -78,10 +78,11 @@ mkdir -p /var/lib/kernlock/quarantine
 chmod 0700 /var/lib/kernlock
 chmod 0700 /var/lib/kernlock/quarantine
 
-# Reload systemd and enable service if systemd is active
+# Reload systemd and enable/start service if systemd is active
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
     systemctl enable kernlock.service || true
+    systemctl restart kernlock.service || true
 fi
 
 exit 0
@@ -102,6 +103,24 @@ fi
 exit 0
 EOF
 chmod 0755 "${PKG_DIR}/DEBIAN/prerm"
+
+# Generate postrm script
+cat <<'EOF' > "${PKG_DIR}/DEBIAN/postrm"
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/kernlock
+    rm -rf /etc/kernlock
+fi
+
+exit 0
+EOF
+chmod 0755 "${PKG_DIR}/DEBIAN/postrm"
 
 echo "==> Building Debian package..."
 dpkg-deb --build --root-owner-group "${PKG_DIR}"

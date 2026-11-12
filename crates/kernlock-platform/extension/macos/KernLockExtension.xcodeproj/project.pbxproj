@@ -1,0 +1,227 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 54;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		9B00000129B1234500000001 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 9B00000229B1234500000001 /* main.c */; };
+		9B00000329B1234500000001 /* EndpointSecurity.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9B00000429B1234500000001 /* EndpointSecurity.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		9B00000229B1234500000001 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
+		9B00000429B1234500000001 /* EndpointSecurity.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = EndpointSecurity.framework; path = System/Library/Frameworks/EndpointSecurity.framework; sourceTree = SDKROOT; };
+		9B00000529B1234500000001 /* com.kernlock.security.dext.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = com.kernlock.security.dext.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
+		9B00000629B1234500000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "com.kernlock.security.dext/Info.plist"; sourceTree = "<group>"; };
+		9B00000729B1234500000001 /* kernlock.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "com.kernlock.security.dext/kernlock.entitlements"; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		9B00000829B1234500000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				9B00000329B1234500000001 /* EndpointSecurity.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		9B00000929B1234500000001 = {
+			isa = PBXGroup;
+			children = (
+				9B00000229B1234500000001 /* main.c */,
+				9B00000A29B1234500000001 /* com.kernlock.security.dext */,
+				9B00000B29B1234500000001 /* Frameworks */,
+				9B00000C29B1234500000001 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		9B00000A29B1234500000001 /* com.kernlock.security.dext */ = {
+			isa = PBXGroup;
+			children = (
+				9B00000629B1234500000001 /* Info.plist */,
+				9B00000729B1234500000001 /* kernlock.entitlements */,
+			);
+			path = com.kernlock.security.dext;
+			sourceTree = "<group>";
+		};
+		9B00000B29B1234500000001 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				9B00000429B1234500000001 /* EndpointSecurity.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		9B00000C29B1234500000001 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				9B00000529B1234500000001 /* com.kernlock.security.dext.systemextension */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		9B00000D29B1234500000001 /* KernLockExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 9B00000E29B1234500000001 /* Build configuration list for PBXNativeTarget "KernLockExtension" */;
+			buildPhases = (
+				9B00000F29B1234500000001 /* Sources */,
+				9B00000829B1234500000001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = KernLockExtension;
+			productName = KernLockExtension;
+			productReference = 9B00000529B1234500000001 /* com.kernlock.security.dext.systemextension */;
+			productType = "com.apple.product-type.system-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		9B00001029B1234500000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1430;
+			};
+			buildConfigurationList = 9B00001129B1234500000001 /* Build configuration list for PBXProject "KernLockExtension" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 9B00000929B1234500000001;
+			productRefGroup = 9B00000C29B1234500000001 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				9B00000D29B1234500000001 /* KernLockExtension */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		9B00000F29B1234500000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				9B00000129B1234500000001 /* main.c in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		9B00001229B1234500000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		9B00001329B1234500000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		9B00001429B1234500000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = "com.kernlock.security.dext/kernlock.entitlements";
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Manual;
+				INFOPLIST_FILE = "com.kernlock.security.dext/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.kernlock.security.dext;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		9B00001529B1234500000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = "com.kernlock.security.dext/kernlock.entitlements";
+				CODE_SIGN_IDENTITY = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
+				INFOPLIST_FILE = "com.kernlock.security.dext/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.kernlock.security.dext;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		9B00001129B1234500000001 /* Build configuration list for PBXProject "KernLockExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9B00001229B1234500000001 /* Debug */,
+				9B00001329B1234500000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		9B00000E29B1234500000001 /* Build configuration list for PBXNativeTarget "KernLockExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9B00001429B1234500000001 /* Debug */,
+				9B00001529B1234500000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = 9B00001029B1234500000001 /* Project object */;
+}

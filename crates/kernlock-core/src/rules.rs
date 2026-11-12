@@ -55,17 +55,25 @@ pub struct CompiledRule {
     pub regex: Regex,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DynamicSignatures {
+    pub hash_signatures: Vec<crate::intelligence::BundleHashSignature>,
+    pub byte_signatures: Vec<(crate::intelligence::BundleByteSignature, Vec<u8>)>,
+}
+
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone)]
 pub struct RuleEngine {
     rules: Arc<RwLock<Vec<CompiledRule>>>,
+    signatures: Arc<RwLock<DynamicSignatures>>,
 }
 
 impl Default for RuleEngine {
     fn default() -> Self {
         Self {
             rules: Arc::new(RwLock::new(Vec::new())),
+            signatures: Arc::new(RwLock::new(DynamicSignatures::default())),
         }
     }
 }
@@ -92,10 +100,20 @@ impl RuleEngine {
         }
         Ok(Self {
             rules: Arc::new(RwLock::new(compiled)),
+            signatures: Arc::new(RwLock::new(DynamicSignatures::default())),
         })
     }
 
     pub fn replace_rules(&self, new_defs: Vec<DetectionRuleDef>) -> Result<(), RuleError> {
+        self.replace_definitions(new_defs, Vec::new(), Vec::new())
+    }
+
+    pub fn replace_definitions(
+        &self,
+        new_defs: Vec<DetectionRuleDef>,
+        hash_sigs: Vec<crate::intelligence::BundleHashSignature>,
+        byte_sigs: Vec<crate::intelligence::BundleByteSignature>,
+    ) -> Result<(), RuleError> {
         let mut compiled = Vec::with_capacity(new_defs.len());
         for def in new_defs {
             let pattern = if def.case_insensitive {
@@ -110,12 +128,86 @@ impl RuleEngine {
             compiled.push(CompiledRule { def, regex });
         }
 
-        let mut guard = self.rules.write().map_err(|_| RuleError::Regex {
+        let mut decoded_bytes = Vec::with_capacity(byte_sigs.len());
+        for b in byte_sigs {
+            let bytes = hex::decode(&b.pattern_hex).map_err(|_| RuleError::Regex {
+                rule_id: b.id.clone(),
+                source: regex::Error::Syntax(format!(
+                    "Invalid hex pattern in byte signature {}",
+                    b.id
+                )),
+            })?;
+            decoded_bytes.push((b, bytes));
+        }
+
+        let mut rules_guard = self.rules.write().map_err(|_| RuleError::Regex {
             rule_id: "lock".to_string(),
             source: regex::Error::Syntax("Lock poisoned".to_string()),
         })?;
-        *guard = compiled;
+        let mut sigs_guard = self.signatures.write().map_err(|_| RuleError::Regex {
+            rule_id: "lock".to_string(),
+            source: regex::Error::Syntax("Lock poisoned".to_string()),
+        })?;
+
+        *rules_guard = compiled;
+        sigs_guard.hash_signatures = hash_sigs;
+        sigs_guard.byte_signatures = decoded_bytes;
         Ok(())
+    }
+
+    pub fn check_signatures(&self, bytes: &[u8], sha256: &str) -> Vec<RuleMatch> {
+        let mut matches = crate::signatures::check_signatures(bytes, sha256);
+
+        if let Ok(guard) = self.signatures.read() {
+            for h in &guard.hash_signatures {
+                if h.sha256.eq_ignore_ascii_case(sha256) {
+                    matches.push(RuleMatch {
+                        rule_id: format!(
+                            "KL-BUNDLE-HASH-{}",
+                            h.sha256.chars().take(8).collect::<String>()
+                        ),
+                        rule_name: h.threat_name.clone(),
+                        severity: h.severity,
+                        score: h.risk_score,
+                        category: EventCategory::File,
+                        explanation: format!(
+                            "Matches SHA-256 hash in threat intelligence bundle: {}",
+                            h.sha256
+                        ),
+                        evidence: format!("sha256={}", sha256),
+                        remediation:
+                            "Quarantine file immediately and inspect endpoint for compromise."
+                                .to_string(),
+                    });
+                }
+            }
+
+            for (b_sig, pattern) in &guard.byte_signatures {
+                if !pattern.is_empty()
+                    && bytes
+                        .windows(pattern.len())
+                        .any(|w| w == pattern.as_slice())
+                {
+                    matches.push(RuleMatch {
+                        rule_id: b_sig.id.clone(),
+                        rule_name: b_sig.threat_name.clone(),
+                        severity: b_sig.severity,
+                        score: b_sig.risk_score,
+                        category: EventCategory::File,
+                        explanation: format!(
+                            "Matches byte signature pattern in threat intelligence bundle: {}",
+                            b_sig.id
+                        ),
+                        evidence: format!("pattern_hex={}", b_sig.pattern_hex),
+                        remediation:
+                            "Quarantine file immediately and inspect execution provenance."
+                                .to_string(),
+                    });
+                }
+            }
+        }
+
+        matches
     }
 
     pub fn builtin() -> Self {

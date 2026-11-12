@@ -4,7 +4,6 @@ use crate::models::{
     RuleMatch, Severity,
 };
 use crate::rules::{RuleEngine, RuleTarget};
-use crate::signatures::check_signatures;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
@@ -212,14 +211,22 @@ pub fn scan_file_streaming(
         }
     }
 
-    // Stream SHA-256 computation in 64KB blocks, retaining first chunk for content inspection
+    scan_stream_reader(&mut file, &path_str, rules, policy)
+}
+
+pub fn scan_stream_reader<R: Read>(
+    reader: &mut R,
+    path_hint: &str,
+    rules: &RuleEngine,
+    policy: &PolicyConfig,
+) -> io::Result<FileScanResult> {
     let mut hasher = Sha256::new();
-    let mut inspect_buf = Vec::with_capacity(DEFAULT_MAX_INSPECT_BYTES.min(meta.len() as usize));
+    let mut inspect_buf = Vec::with_capacity(DEFAULT_MAX_INSPECT_BYTES);
     let mut read_buf = [0u8; 64 * 1024];
     let mut total_bytes = 0u64;
 
     loop {
-        let n = file.read(&mut read_buf)?;
+        let n = reader.read(&mut read_buf)?;
         if n == 0 {
             break;
         }
@@ -233,11 +240,11 @@ pub fn scan_file_streaming(
     }
 
     let sha256 = hex::encode(hasher.finalize());
-    let file_type = detect_file_type(&path_str, &inspect_buf);
+    let file_type = detect_file_type(path_hint, &inspect_buf);
     let entropy = shannon_entropy(&inspect_buf);
 
     evaluate_scan_details(
-        &path_str,
+        path_hint,
         sha256,
         total_bytes,
         file_type,
@@ -246,6 +253,40 @@ pub fn scan_file_streaming(
         rules,
         policy,
     )
+}
+
+#[cfg(unix)]
+pub fn scan_file_from_fd(
+    raw_fd: std::os::fd::RawFd,
+    path_hint: &str,
+    rules: &RuleEngine,
+    policy: &PolicyConfig,
+) -> io::Result<FileScanResult> {
+    use std::os::fd::FromRawFd;
+
+    let dup_fd = unsafe { libc::dup(raw_fd) };
+    if dup_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Rewind file descriptor offset to the start of the file
+    unsafe { libc::lseek(dup_fd, 0, libc::SEEK_SET) };
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+    scan_stream_reader(&mut file, path_hint, rules, policy)
+}
+
+#[cfg(not(unix))]
+pub fn scan_file_from_fd(
+    _raw_fd: i32,
+    _path_hint: &str,
+    _rules: &RuleEngine,
+    _policy: &PolicyConfig,
+) -> io::Result<FileScanResult> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "scan_file_from_fd is Unix-only",
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -280,8 +321,8 @@ fn evaluate_scan_details(
 
     let mut matches = Vec::new();
 
-    // 1. Signature database checks (exact hash + byte patterns, including EICAR)
-    matches.extend(check_signatures(inspect_bytes, &sha256));
+    // 1. Signature database checks (exact hash + byte patterns, including dynamic bundles)
+    matches.extend(rules.check_signatures(inspect_bytes, &sha256));
 
     // 2. Format structure validation & anomaly detection (ELF, PE, Mach-O)
     matches.extend(validate_binary_format(path, inspect_bytes));

@@ -7,7 +7,7 @@ After=network.target local-fs.target
 Type=simple
 User=root
 Group=root
-ExecStart=/usr/local/bin/kernlock serve --data-dir /var/lib/kernlock
+ExecStart=/usr/bin/kernlock serve --data-dir /var/lib/kernlock
 Restart=always
 RestartSec=5s
 

@@ -129,3 +129,88 @@ fn test_atomic_rule_engine_replacement_and_rollback_on_error() {
     assert_eq!(engine.rule_count(), 2);
     assert_eq!(engine.rules()[0].id, "KL-NEW-001");
 }
+
+#[test]
+fn test_anti_rollback_version_validation() {
+    let base_ts = Utc::now();
+
+    // 1. Monotonically increasing versions succeed
+    assert!(kernlock_core::validate_version_advance(
+        "2026.11.12.1",
+        Some(base_ts),
+        "2026.11.12.2",
+        base_ts + chrono::Duration::seconds(10),
+    )
+    .is_ok());
+
+    // 2. Equal version rejected
+    assert!(kernlock_core::validate_version_advance(
+        "2026.11.12.2",
+        Some(base_ts),
+        "2026.11.12.2",
+        base_ts + chrono::Duration::seconds(10),
+    )
+    .is_err());
+
+    // 3. Lower version rejected (rollback)
+    let err = kernlock_core::validate_version_advance(
+        "2026.11.12.2",
+        Some(base_ts),
+        "2026.11.12.1",
+        base_ts + chrono::Duration::seconds(10),
+    )
+    .unwrap_err();
+    assert!(matches!(err, IntelligenceError::RollbackRejected { .. }));
+
+    // 4. Stale timestamp rejected
+    let err_ts = kernlock_core::validate_version_advance(
+        "2026.11.12.1",
+        Some(base_ts),
+        "2026.11.12.2",
+        base_ts - chrono::Duration::seconds(10),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err_ts,
+        IntelligenceError::TimestampRollbackRejected { .. }
+    ));
+}
+
+#[test]
+fn test_manifest_signature_tampering_rejects_modified_hashes_and_bytes() {
+    let signing_key = SigningKey::from_bytes(&[77u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+
+    let manifest = ThreatBundleManifest {
+        version: "2026.11.12.10".to_string(),
+        timestamp: Utc::now(),
+        rules: vec![],
+        hash_signatures: vec![BundleHashSignature {
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            threat_name: "Trojan.A".to_string(),
+            severity: Severity::High,
+            risk_score: 90,
+        }],
+        byte_signatures: vec![BundleByteSignature {
+            id: "SIG-01".to_string(),
+            pattern_hex: "deadbeef".to_string(),
+            threat_name: "Trojan.B".to_string(),
+            severity: Severity::Critical,
+            risk_score: 99,
+        }],
+    };
+
+    let bundle = SignedThreatBundle::new(manifest, &signing_key).unwrap();
+    assert!(bundle.verify(&verifying_key).is_ok());
+
+    // Modify hash signatures in manifest -> signature verification MUST fail
+    let mut tampered_hashes = bundle.clone();
+    tampered_hashes.manifest.hash_signatures[0].sha256 =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+    assert!(tampered_hashes.verify(&verifying_key).is_err());
+
+    // Modify byte signatures in manifest -> signature verification MUST fail
+    let mut tampered_bytes = bundle.clone();
+    tampered_bytes.manifest.byte_signatures[0].pattern_hex = "cafebabe".to_string();
+    assert!(tampered_bytes.verify(&verifying_key).is_err());
+}

@@ -13,7 +13,11 @@ use uuid::Uuid;
     about = "KernLock Security — Detect. Block. Explain."
 )]
 struct Cli {
-    #[arg(long, help = "Directory for SQLite database and quarantine vault")]
+    #[arg(
+        global = true,
+        long,
+        help = "Directory for SQLite database and quarantine vault"
+    )]
     data_dir: Option<PathBuf>,
 
     #[command(subcommand)]

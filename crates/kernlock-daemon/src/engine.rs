@@ -13,8 +13,9 @@ use kernlock_platform::{
 use kernlock_quarantine::QuarantineManager;
 use kernlock_storage::Storage;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -29,6 +30,7 @@ pub struct KernLockEngine {
     watcher_active: Arc<Mutex<bool>>,
     fanotify_monitor: Arc<Mutex<Option<FanotifyPermissionMonitor>>>,
     definitions_status: Arc<Mutex<DefinitionStatus>>,
+    trusted_keys: Arc<RwLock<HashSet<String>>>,
 }
 
 impl KernLockEngine {
@@ -70,6 +72,10 @@ impl KernLockEngine {
             official_public_key: OFFICIAL_PUBLIC_KEY_HEX.to_string(),
         }));
 
+        let mut initial_trusted = HashSet::new();
+        initial_trusted.insert(OFFICIAL_PUBLIC_KEY_HEX.to_lowercase());
+        let trusted_keys = Arc::new(RwLock::new(initial_trusted));
+
         Ok(Self {
             rules,
             storage,
@@ -79,7 +85,14 @@ impl KernLockEngine {
             watcher_active: Arc::new(Mutex::new(false)),
             fanotify_monitor: Arc::new(Mutex::new(None)),
             definitions_status,
+            trusted_keys,
         })
+    }
+
+    pub fn add_trusted_key_hex(&self, key_hex: &str) {
+        if let Ok(mut guard) = self.trusted_keys.write() {
+            guard.insert(key_hex.trim().to_lowercase());
+        }
     }
 
     pub fn capabilities(&self) -> PlatformCapabilities {
@@ -98,24 +111,56 @@ impl KernLockEngine {
     }
 
     pub fn update_definitions(&self, bundle: SignedThreatBundle) -> Result<DefinitionStatus> {
-        let verified = bundle.verify_official().is_ok()
-            || bundle
-                .public_key_hex
-                .as_deref()
-                .map(|pk| bundle.verify_with_hex_key(pk).is_ok())
-                .unwrap_or(false);
+        // 1. Verify bundle against explicitly pinned trusted keys ONLY
+        let trusted_keys = self
+            .trusted_keys
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        let mut verified = false;
+        for trusted_key in &trusted_keys {
+            if bundle.verify_with_hex_key(trusted_key).is_ok() {
+                verified = true;
+                break;
+            }
+        }
 
         if !verified {
             return Err(anyhow::anyhow!(
-                "Cryptographic signature verification failed: bundle was modified or signature is invalid"
+                "Cryptographic signature verification failed: bundle is not signed by any pinned trusted public key (self-supplied or unknown keys rejected)"
             ));
         }
 
-        let new_rule_count = bundle.manifest.rules.len();
-        self.rules
-            .replace_rules(bundle.manifest.rules)
-            .map_err(|e| anyhow::anyhow!("Failed to compile updated rule definitions: {}", e))?;
+        // 2. Anti-rollback validation: version and timestamp must strictly advance
+        let current_status = self
+            .definitions_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
+        kernlock_core::validate_version_advance(
+            &current_status.version,
+            Some(current_status.last_updated),
+            &bundle.manifest.version,
+            bundle.manifest.timestamp,
+        )
+        .map_err(|e| anyhow::anyhow!("Version rollback rejected: {}", e))?;
+
+        // 3. Atomically replace rules AND dynamic hash/byte signatures in scanner engine
+        let new_rule_count = bundle.manifest.rules.len();
+        let new_hash_count = bundle.manifest.hash_signatures.len();
+        let new_byte_count = bundle.manifest.byte_signatures.len();
+
+        self.rules
+            .replace_definitions(
+                bundle.manifest.rules,
+                bundle.manifest.hash_signatures,
+                bundle.manifest.byte_signatures,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to compile updated threat definitions: {}", e))?;
+
+        // 4. Update cached status only after atomic replacement succeeds
         let mut status = self
             .definitions_status
             .lock()
@@ -123,8 +168,8 @@ impl KernLockEngine {
         status.version = bundle.manifest.version;
         status.last_updated = bundle.manifest.timestamp;
         status.rule_count = new_rule_count;
-        status.hash_signature_count = bundle.manifest.hash_signatures.len();
-        status.byte_signature_count = bundle.manifest.byte_signatures.len();
+        status.hash_signature_count = new_hash_count;
+        status.byte_signature_count = new_byte_count;
 
         let updated_status = status.clone();
         drop(status);

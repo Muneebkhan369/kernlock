@@ -17,11 +17,18 @@ pub enum IntelligenceError {
     Serialization(String),
     #[error("Bundle validation error: {0}")]
     Validation(String),
+    #[error("Version rollback rejected: candidate version {candidate} is not newer than current version {current}")]
+    RollbackRejected { candidate: String, current: String },
+    #[error("Timestamp rollback rejected: candidate timestamp {candidate} is not newer than current timestamp {current}")]
+    TimestampRollbackRejected {
+        candidate: DateTime<Utc>,
+        current: DateTime<Utc>,
+    },
 }
 
 /// Official KernLock Threat Intelligence pinned public key (32 bytes hex)
 pub const OFFICIAL_PUBLIC_KEY_HEX: &str =
-    "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    "69d50c0ac704c7d545b942deb8427f610a0611e1a5194cc09d0f5ffd9a71d181";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefinitionStatus {
@@ -126,4 +133,39 @@ impl SignedThreatBundle {
     pub fn verify_official(&self) -> Result<(), IntelligenceError> {
         self.verify_with_hex_key(OFFICIAL_PUBLIC_KEY_HEX)
     }
+}
+
+pub fn parse_version_tuple(v: &str) -> Vec<u64> {
+    v.split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
+pub fn validate_version_advance(
+    current_ver: &str,
+    current_ts: Option<DateTime<Utc>>,
+    candidate_ver: &str,
+    candidate_ts: DateTime<Utc>,
+) -> Result<(), IntelligenceError> {
+    let curr_parts = parse_version_tuple(current_ver);
+    let cand_parts = parse_version_tuple(candidate_ver);
+
+    if cand_parts <= curr_parts {
+        return Err(IntelligenceError::RollbackRejected {
+            candidate: candidate_ver.to_string(),
+            current: current_ver.to_string(),
+        });
+    }
+
+    if let Some(ts) = current_ts {
+        if candidate_ts <= ts {
+            return Err(IntelligenceError::TimestampRollbackRejected {
+                candidate: candidate_ts,
+                current: ts,
+            });
+        }
+    }
+
+    Ok(())
 }
