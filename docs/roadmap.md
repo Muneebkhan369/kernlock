@@ -29,6 +29,12 @@
 - [x] Authenticated `/api/status` daemon probe in Tauri rejecting spoofed/unrelated services on port 17420
 - [x] Atomic `O_CREAT | O_EXCL` (`create_new`) token creation without overwrite fallbacks and `>= 32`-char `KERNLOCK_API_TOKEN` validation
 
+## Phase 1.4 — Release Packaging Validation & Recovery Auditing (Completed)
+- [x] Official Tauri 2 sidecar integration via `tauri-plugin-shell` (`ShellExt::sidecar("kernlock")`) with robust process fallback
+- [x] Cross-platform sidecar builder (`prepare-sidecar.mjs`) supporting x86_64 & ARM64 targets with ELF/PE/Mach-O binary header architecture validation
+- [x] Startup quarantine recovery audit (`QuarantineManager::recover_on_startup`) recovering interrupted `Deleting`/`Deleted` staging files with mandatory SHA-256 verification (never deletes unverified files)
+- [x] Clean-installation simulation testing with empty `PATH` and documented Linux packaging prerequisites (`gdk-3.0` / WebKitGTK)
+
 ## Phase 2 — Privileged Linux Enforcement & YARA/Sigma Parity
 - [ ] Privileged `fanotify` (`FAN_OPEN_PERM`) helper daemon with PolicyKit/sudo privilege separation
 - [ ] Optional `libyara` / `yara-x` integration for native `.yar` rule files

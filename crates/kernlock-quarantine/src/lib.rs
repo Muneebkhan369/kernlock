@@ -38,6 +38,27 @@ impl std::fmt::Display for RollbackFailureInfo {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoveryAuditReport {
+    /// Records that were interrupted in `Deleting` or had a stranded `.deleting_<id>.locked`
+    /// file verified by SHA-256 and safely rolled back to `vault_path` with status `Quarantined`.
+    pub recovered_to_quarantine: Vec<Uuid>,
+    /// Records that were committed `Deleted` in the DB whose verified `.deleting_<id>.locked`
+    /// file was safely unlinked after SHA-256 verification.
+    pub finalized_deletions: Vec<Uuid>,
+    /// Stranded staging files found on disk that could NOT be verified (SHA-256 mismatch or unknown).
+    /// These files are NEVER automatically deleted.
+    pub unverified_stranded_files: Vec<String>,
+}
+
+impl RecoveryAuditReport {
+    pub fn is_empty(&self) -> bool {
+        self.recovered_to_quarantine.is_empty()
+            && self.finalized_deletions.is_empty()
+            && self.unverified_stranded_files.is_empty()
+    }
+}
+
 #[derive(Debug)]
 pub struct CleanupFailureInfo {
     pub operation: &'static str,
@@ -606,6 +627,206 @@ impl QuarantineManager {
 
     pub fn list(&self) -> Result<Vec<QuarantineRecord>, QuarantineError> {
         Ok(self.storage.list_quarantine()?)
+    }
+
+    /// Startup recovery inspection for stranded staging files and interrupted deletions.
+    ///
+    /// - Checks `.deleting_<id>.locked` staging files:
+    ///   - Verifies SHA-256 against DB record.
+    ///   - If DB status is `Deleted` and SHA-256 matches: safely unlinks staging file (`finalized_deletions`).
+    ///   - If DB status is `Deleting` or `Quarantined` and SHA-256 matches: safely rolls back to `vault_path`
+    ///     with `0600` permissions and restores DB status to `Quarantined` (`recovered_to_quarantine`).
+    ///   - If SHA-256 does NOT match or record is missing: NEVER deletes, reports as `unverified_stranded_files`.
+    /// - Checks orphaned `.kernlock_staging_<uuid>` files:
+    ///   - If SHA-256 matches a verified record whose vault or original file is intact, cleans up the abandoned staging file.
+    ///   - If unverified or no intact copy exists: NEVER deletes, reports as `unverified_stranded_files`.
+    /// - Checks DB records stuck in `Deleting`:
+    ///   - If `vault_path` exists with matching SHA-256: reverts DB to `Quarantined`.
+    ///   - If neither `vault_path` nor deleting staging file exists: marks `Deleted`.
+    pub fn recover_on_startup(&self) -> Result<RecoveryAuditReport, QuarantineError> {
+        let mut report = RecoveryAuditReport::default();
+
+        if let Ok(entries) = fs::read_dir(&self.vault_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_name = entry.file_name().to_string_lossy().to_string();
+
+                if file_name.starts_with(".deleting_") && file_name.ends_with(".locked") {
+                    let id_str = file_name
+                        .trim_start_matches(".deleting_")
+                        .trim_end_matches(".locked");
+                    let id = match Uuid::parse_str(id_str) {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            report
+                                .unverified_stranded_files
+                                .push(path.display().to_string());
+                            continue;
+                        }
+                    };
+
+                    match self.storage.get_quarantine(id) {
+                        Ok(record) => {
+                            let bytes = match read_regular_nofollow(&path) {
+                                Ok(b) => b,
+                                Err(_) => {
+                                    report
+                                        .unverified_stranded_files
+                                        .push(path.display().to_string());
+                                    continue;
+                                }
+                            };
+                            let actual_sha = sha256_hex(&bytes);
+
+                            if actual_sha != record.sha256 {
+                                // SHA-256 mismatch: NEVER automatically delete unverified files!
+                                report
+                                    .unverified_stranded_files
+                                    .push(path.display().to_string());
+                                continue;
+                            }
+
+                            match record.status {
+                                QuarantineStatus::Deleted => {
+                                    // DB committed Deleted, SHA-256 verified -> safe to unlink.
+                                    if fs::remove_file(&path).is_ok() {
+                                        report.finalized_deletions.push(id);
+                                    } else {
+                                        report
+                                            .unverified_stranded_files
+                                            .push(path.display().to_string());
+                                    }
+                                }
+                                QuarantineStatus::Deleting | QuarantineStatus::Quarantined => {
+                                    let vault_target = PathBuf::from(&record.vault_path);
+                                    if !vault_target.exists() {
+                                        if move_file_no_clobber(&path, &vault_target).is_ok() {
+                                            let _ = set_mode(&vault_target, 0o600);
+                                            let _ = self.storage.update_quarantine_status(
+                                                id,
+                                                QuarantineStatus::Quarantined,
+                                                None,
+                                            );
+                                            report.recovered_to_quarantine.push(id);
+                                        } else {
+                                            report
+                                                .unverified_stranded_files
+                                                .push(path.display().to_string());
+                                        }
+                                    } else if let Ok(vault_bytes) =
+                                        read_regular_nofollow(&vault_target)
+                                    {
+                                        if sha256_hex(&vault_bytes) == record.sha256 {
+                                            let _ = fs::remove_file(&path);
+                                            let _ = self.storage.update_quarantine_status(
+                                                id,
+                                                QuarantineStatus::Quarantined,
+                                                None,
+                                            );
+                                            report.recovered_to_quarantine.push(id);
+                                        } else {
+                                            report
+                                                .unverified_stranded_files
+                                                .push(path.display().to_string());
+                                        }
+                                    } else {
+                                        report
+                                            .unverified_stranded_files
+                                            .push(path.display().to_string());
+                                    }
+                                }
+                                QuarantineStatus::Restored => {
+                                    report
+                                        .unverified_stranded_files
+                                        .push(path.display().to_string());
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // No DB record found for this UUID: NEVER automatically delete!
+                            report
+                                .unverified_stranded_files
+                                .push(path.display().to_string());
+                        }
+                    }
+                } else if file_name.starts_with(".kernlock_staging_") {
+                    let bytes = match read_regular_nofollow(&path) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            report
+                                .unverified_stranded_files
+                                .push(path.display().to_string());
+                            continue;
+                        }
+                    };
+                    let actual_sha = sha256_hex(&bytes);
+                    let all_records = self.storage.list_quarantine().unwrap_or_default();
+                    let matching_record = all_records.into_iter().find(|r| r.sha256 == actual_sha);
+
+                    if let Some(rec) = matching_record {
+                        let vault_exists = Path::new(&rec.vault_path).is_file();
+                        let orig_exists = Path::new(&rec.original_path).is_file();
+                        if vault_exists || orig_exists {
+                            if fs::remove_file(&path).is_err() {
+                                report
+                                    .unverified_stranded_files
+                                    .push(path.display().to_string());
+                            }
+                        } else {
+                            report
+                                .unverified_stranded_files
+                                .push(path.display().to_string());
+                        }
+                    } else {
+                        report
+                            .unverified_stranded_files
+                            .push(path.display().to_string());
+                    }
+                }
+            }
+        }
+
+        let deleting_records = self
+            .storage
+            .list_quarantine_by_status(QuarantineStatus::Deleting)?;
+        for record in deleting_records {
+            if report.recovered_to_quarantine.contains(&record.id)
+                || report.finalized_deletions.contains(&record.id)
+            {
+                continue;
+            }
+
+            let vault_path = PathBuf::from(&record.vault_path);
+            let deleting_path = self
+                .vault_dir
+                .join(format!(".deleting_{}.locked", record.id));
+
+            if vault_path.is_file() {
+                if let Ok(bytes) = read_regular_nofollow(&vault_path) {
+                    if sha256_hex(&bytes) == record.sha256 {
+                        self.storage.update_quarantine_status(
+                            record.id,
+                            QuarantineStatus::Quarantined,
+                            None,
+                        )?;
+                        report.recovered_to_quarantine.push(record.id);
+                    } else {
+                        report
+                            .unverified_stranded_files
+                            .push(vault_path.display().to_string());
+                    }
+                }
+            } else if !deleting_path.is_file() {
+                self.storage.update_quarantine_status(
+                    record.id,
+                    QuarantineStatus::Deleted,
+                    None,
+                )?;
+                report.finalized_deletions.push(record.id);
+            }
+        }
+
+        Ok(report)
     }
 }
 

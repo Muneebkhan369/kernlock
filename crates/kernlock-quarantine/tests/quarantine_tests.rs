@@ -418,3 +418,110 @@ fn delete_permanently_uses_recoverable_deleting_state_and_rolls_back() {
         other => panic!("Expected CleanupFailed, got {other:?}"),
     }
 }
+
+#[test]
+fn startup_recovery_audits_and_recovers_crashes_at_every_deletion_stage() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    // --- Scenario 1: Crash at Step 1 (DB set to Deleting, file still at vault_path) ---
+    let t1 = tmp.path().join("file1.bin");
+    fs::write(&t1, b"payload one").unwrap();
+    let rec1 = qm.quarantine_file(&t1, "s1").unwrap();
+    storage
+        .update_quarantine_status(rec1.id, QuarantineStatus::Deleting, None)
+        .unwrap();
+
+    // --- Scenario 2: Crash at Step 2 (file moved to .deleting_<id>.locked, DB still Deleting) ---
+    let t2 = tmp.path().join("file2.bin");
+    fs::write(&t2, b"payload two").unwrap();
+    let rec2 = qm.quarantine_file(&t2, "s2").unwrap();
+    storage
+        .update_quarantine_status(rec2.id, QuarantineStatus::Deleting, None)
+        .unwrap();
+    let vault_path2 = std::path::PathBuf::from(&rec2.vault_path);
+    let staged_path2 = vault_dir.join(format!(".deleting_{}.locked", rec2.id));
+    fs::rename(&vault_path2, &staged_path2).unwrap();
+
+    // --- Scenario 3: Crash at Step 3 (DB set to Deleted, .deleting_<id>.locked not unlinked) ---
+    let t3 = tmp.path().join("file3.bin");
+    fs::write(&t3, b"payload three").unwrap();
+    let rec3 = qm.quarantine_file(&t3, "s3").unwrap();
+    let vault_path3 = std::path::PathBuf::from(&rec3.vault_path);
+    let staged_path3 = vault_dir.join(format!(".deleting_{}.locked", rec3.id));
+    fs::rename(&vault_path3, &staged_path3).unwrap();
+    storage
+        .update_quarantine_status(rec3.id, QuarantineStatus::Deleted, None)
+        .unwrap();
+
+    // --- Scenario 4: Corrupted / Tampered staging file (SHA-256 mismatch) ---
+    let t4 = tmp.path().join("file4.bin");
+    fs::write(&t4, b"payload four original").unwrap();
+    let rec4 = qm.quarantine_file(&t4, "s4").unwrap();
+    let vault_path4 = std::path::PathBuf::from(&rec4.vault_path);
+    let staged_path4 = vault_dir.join(format!(".deleting_{}.locked", rec4.id));
+    fs::remove_file(&vault_path4).unwrap();
+    fs::write(&staged_path4, b"TAMPERED BYTES!").unwrap(); // Mismatched SHA-256!
+
+    // --- Scenario 5: Orphaned cross-fs staging file with verified existing duplicate ---
+    let staged_dup = vault_dir.join(format!(".kernlock_staging_{}", uuid::Uuid::new_v4()));
+    fs::write(&staged_dup, b"payload one").unwrap(); // matches rec1
+
+    // --- Scenario 6: Unknown stranded staging file (no matching DB record) ---
+    let staged_unknown = vault_dir.join(format!(".kernlock_staging_{}", uuid::Uuid::new_v4()));
+    fs::write(&staged_unknown, b"mystery bytes from interrupted operation").unwrap();
+
+    // Run startup recovery!
+    let report = qm.recover_on_startup().unwrap();
+
+    // Assertions for Scenario 1:
+    assert!(report.recovered_to_quarantine.contains(&rec1.id));
+    assert_eq!(
+        storage.get_quarantine(rec1.id).unwrap().status,
+        QuarantineStatus::Quarantined
+    );
+    assert!(std::path::Path::new(&rec1.vault_path).is_file());
+
+    // Assertions for Scenario 2:
+    assert!(report.recovered_to_quarantine.contains(&rec2.id));
+    assert_eq!(
+        storage.get_quarantine(rec2.id).unwrap().status,
+        QuarantineStatus::Quarantined
+    );
+    assert!(vault_path2.is_file());
+    assert!(!staged_path2.exists());
+
+    // Assertions for Scenario 3:
+    assert!(report.finalized_deletions.contains(&rec3.id));
+    assert_eq!(
+        storage.get_quarantine(rec3.id).unwrap().status,
+        QuarantineStatus::Deleted
+    );
+    assert!(!staged_path3.exists());
+
+    // Assertions for Scenario 4: Tampered file must NEVER be deleted!
+    assert!(
+        staged_path4.exists(),
+        "Unverified / corrupted file must NEVER be deleted automatically"
+    );
+    assert!(report
+        .unverified_stranded_files
+        .contains(&staged_path4.display().to_string()));
+
+    // Assertions for Scenario 5: Verified duplicate staging file was safely cleaned up
+    assert!(
+        !staged_dup.exists(),
+        "Verified duplicate staging file should be cleaned up"
+    );
+
+    // Assertions for Scenario 6: Unknown staging file must NEVER be deleted!
+    assert!(
+        staged_unknown.exists(),
+        "Unknown staging file must NOT be deleted without verification"
+    );
+    assert!(report
+        .unverified_stranded_files
+        .contains(&staged_unknown.display().to_string()));
+}

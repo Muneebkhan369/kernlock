@@ -11,6 +11,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::Manager;
+use tauri_plugin_shell::process::CommandChild;
+use tauri_plugin_shell::ShellExt;
 
 const DAEMON_PORT: u16 = 17420;
 
@@ -21,8 +23,27 @@ struct DaemonStatus {
     error: Option<String>,
 }
 
+enum ManagedChild {
+    Sidecar(CommandChild),
+    Process(Child),
+}
+
+impl ManagedChild {
+    fn kill(&mut self) {
+        match self {
+            ManagedChild::Sidecar(c) => {
+                let _ = c.kill();
+            }
+            ManagedChild::Process(c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+}
+
 struct DaemonState {
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<ManagedChild>>,
     status: Mutex<DaemonStatus>,
 }
 
@@ -65,7 +86,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// Locate the bundled Tauri sidecar binary without relying on user `PATH`.
+/// Fallback helper to locate sidecar next to current_exe() if direct sidecar lookup needs fallback.
 fn locate_bundled_daemon() -> Result<PathBuf, String> {
     let bin_name = daemon_binary_name();
     let exe = std::env::current_exe()
@@ -74,7 +95,7 @@ fn locate_bundled_daemon() -> Result<PathBuf, String> {
         .parent()
         .ok_or_else(|| "Desktop executable has no parent directory".to_string())?;
 
-    // 1. Standard Tauri 2 installed sidecar location: sibling `kernlock` / `kernlock.exe`.
+    // 1. Sibling binary (production installed layout)
     let sibling = exe_dir.join(bin_name);
     if sibling.exists() {
         if is_executable_file(&sibling) {
@@ -86,7 +107,7 @@ fn locate_bundled_daemon() -> Result<PathBuf, String> {
         ));
     }
 
-    // 2. Fallback for unbundled `cargo run`: `binaries/kernlock-*` next to executable or in src-tauri.
+    // 2. binaries/kernlock-* in app bundle / dev layout
     let binaries_dir = exe_dir.join("binaries");
     if let Ok(entries) = fs::read_dir(&binaries_dir) {
         for entry in entries.flatten() {
@@ -129,7 +150,7 @@ fn set_status(state: &DaemonState, status: DaemonStatus) -> DaemonStatus {
     status
 }
 
-fn ensure_daemon_running(state: &DaemonState) -> DaemonStatus {
+fn ensure_daemon_running(app: &tauri::AppHandle, state: &DaemonState) -> DaemonStatus {
     let existing_token = match load_configured_token() {
         Ok(tok) => tok,
         Err(e) => {
@@ -175,8 +196,7 @@ fn ensure_daemon_running(state: &DaemonState) -> DaemonStatus {
     {
         let mut guard = state.child.lock().unwrap();
         if let Some(mut existing) = guard.take() {
-            let _ = existing.kill();
-            let _ = existing.wait();
+            existing.kill();
         }
     }
 
@@ -196,20 +216,6 @@ fn ensure_daemon_running(state: &DaemonState) -> DaemonStatus {
         );
     }
 
-    let bin_path = match locate_bundled_daemon() {
-        Ok(p) => p,
-        Err(e) => {
-            return set_status(
-                state,
-                DaemonStatus {
-                    running: false,
-                    managed_by_desktop: false,
-                    error: Some(e),
-                },
-            );
-        }
-    };
-
     let log_path = data_dir.join("daemon.log");
     let (stdout_cfg, stderr_cfg) = match OpenOptions::new().create(true).append(true).open(&log_path)
     {
@@ -220,34 +226,66 @@ fn ensure_daemon_running(state: &DaemonState) -> DaemonStatus {
         Err(_) => (Stdio::null(), Stdio::null()),
     };
 
-    let mut cmd = Command::new(&bin_path);
-    cmd.arg("--data-dir")
-        .arg(&data_dir)
-        .arg("serve")
-        .arg("--port")
-        .arg(DAEMON_PORT.to_string())
-        .stdout(stdout_cfg)
-        .stderr(stderr_cfg);
+    // 3. Spawn daemon: try official Tauri 2 Shell sidecar first, then fallback to locate_bundled_daemon
+    let sidecar_result = app
+        .shell()
+        .sidecar("kernlock")
+        .and_then(|cmd| {
+            cmd.args([
+                "--data-dir",
+                data_dir.to_str().unwrap_or("."),
+                "serve",
+                "--port",
+                &DAEMON_PORT.to_string(),
+            ])
+            .spawn()
+        });
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return set_status(
-                state,
-                DaemonStatus {
-                    running: false,
-                    managed_by_desktop: false,
-                    error: Some(format!(
-                        "Failed to start bundled KernLock daemon ({}): {}",
-                        bin_path.display(),
-                        e
-                    )),
-                },
-            );
-        }
+    let child = match sidecar_result {
+        Ok((_rx, sidecar_child)) => ManagedChild::Sidecar(sidecar_child),
+        Err(sidecar_err) => match locate_bundled_daemon() {
+            Ok(bin_path) => {
+                let mut cmd = Command::new(&bin_path);
+                cmd.arg("--data-dir")
+                    .arg(&data_dir)
+                    .arg("serve")
+                    .arg("--port")
+                    .arg(DAEMON_PORT.to_string())
+                    .stdout(stdout_cfg)
+                    .stderr(stderr_cfg);
+                match cmd.spawn() {
+                    Ok(process_child) => ManagedChild::Process(process_child),
+                    Err(proc_err) => {
+                        return set_status(
+                            state,
+                            DaemonStatus {
+                                running: false,
+                                managed_by_desktop: false,
+                                error: Some(format!(
+                                    "Failed to start sidecar ({sidecar_err}) and process fallback ({}): {proc_err}",
+                                    bin_path.display()
+                                )),
+                            },
+                        );
+                    }
+                }
+            }
+            Err(loc_err) => {
+                return set_status(
+                    state,
+                    DaemonStatus {
+                        running: false,
+                        managed_by_desktop: false,
+                        error: Some(format!(
+                            "Failed to start Tauri sidecar ({sidecar_err}); fallback lookup failed: {loc_err}"
+                        )),
+                    },
+                );
+            }
+        },
     };
 
-    // 3. Wait up to 5 seconds for authenticated readiness.
+    // 4. Wait up to 5 seconds for authenticated readiness.
     for _ in 0..25 {
         if let Ok(Some(tok)) = load_configured_token() {
             if probe_authenticated_daemon(DAEMON_PORT, Some(&tok))
@@ -264,25 +302,11 @@ fn ensure_daemon_running(state: &DaemonState) -> DaemonStatus {
                 );
             }
         }
-        if let Ok(Some(exit)) = child.try_wait() {
-            return set_status(
-                state,
-                DaemonStatus {
-                    running: false,
-                    managed_by_desktop: false,
-                    error: Some(format!(
-                        "KernLock daemon exited prematurely with status {}. Check {}",
-                        exit,
-                        log_path.display()
-                    )),
-                },
-            );
-        }
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    let mut doomed = child;
+    doomed.kill();
     set_status(
         state,
         DaemonStatus {
@@ -298,8 +322,7 @@ fn ensure_daemon_running(state: &DaemonState) -> DaemonStatus {
 
 fn shutdown_daemon(state: &DaemonState) {
     if let Some(mut child) = state.child.lock().unwrap().take() {
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill();
     }
 }
 
@@ -324,17 +347,19 @@ fn get_daemon_status(state: tauri::State<'_, DaemonState>) -> DaemonStatus {
 }
 
 #[tauri::command]
-fn restart_daemon(state: tauri::State<'_, DaemonState>) -> DaemonStatus {
+fn restart_daemon(app: tauri::AppHandle, state: tauri::State<'_, DaemonState>) -> DaemonStatus {
     shutdown_daemon(&state);
-    ensure_daemon_running(&state)
+    ensure_daemon_running(&app, &state)
 }
 
 fn main() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
         .manage(DaemonState::default())
         .setup(|app| {
+            let app_handle = app.handle().clone();
             let state = app.state::<DaemonState>();
-            ensure_daemon_running(&state);
+            ensure_daemon_running(&app_handle, &state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -33,6 +33,15 @@ impl KernLockEngine {
 
         let storage = Storage::open(db_path)?;
         let quarantine = QuarantineManager::new(vault_dir, storage.clone())?;
+        let recovery_report = quarantine.recover_on_startup()?;
+        if !recovery_report.is_empty() {
+            info!(
+                "Quarantine startup recovery audit: {} recovered, {} finalized deletions, {} unverified stranded files",
+                recovery_report.recovered_to_quarantine.len(),
+                recovery_report.finalized_deletions.len(),
+                recovery_report.unverified_stranded_files.len()
+            );
+        }
         let rules = Arc::new(RuleEngine::builtin());
         let provider = Arc::new(default_provider());
 

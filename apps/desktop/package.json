@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
     "prepare:sidecar:release": "node scripts/prepare-sidecar.mjs --release",
+    "sidecar:check": "node scripts/prepare-sidecar.mjs --check",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"

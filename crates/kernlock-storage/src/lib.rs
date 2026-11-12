@@ -399,6 +399,56 @@ impl Storage {
         Ok(out)
     }
 
+    pub fn list_quarantine_by_status(
+        &self,
+        status: QuarantineStatus,
+    ) -> Result<Vec<QuarantineRecord>, StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        let status_json = serde_json::to_string(&status)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, original_path, vault_path, sha256, original_mode, size_bytes, reason, quarantined_at, restored_at, status
+             FROM quarantine_records WHERE status = ?1 ORDER BY quarantined_at DESC",
+        )?;
+        let rows = stmt.query_map(params![status_json], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (id_s, orig, vault, sha, mode, size, reason, q_at, r_at, status_s) = r?;
+            out.push(QuarantineRecord {
+                id: Uuid::parse_str(&id_s).unwrap_or_else(|_| Uuid::new_v4()),
+                original_path: orig,
+                vault_path: vault,
+                sha256: sha,
+                original_mode: mode as u32,
+                size_bytes: size as u64,
+                reason,
+                quarantined_at: DateTime::parse_from_rfc3339(&q_at)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                restored_at: r_at.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc))
+                }),
+                status: serde_json::from_str(&status_s)?,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn update_quarantine_status(
         &self,
         id: Uuid,

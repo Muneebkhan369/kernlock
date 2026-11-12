@@ -34,3 +34,9 @@ KernLock intentionally avoids undocumented OS hacks or unstable kernel modules. 
 
 - `kernlockd` binds strictly to `127.0.0.1` and requires a Bearer token (`<data_dir>/auth.token`, mode `0600`) for all `/api/*` routes except `/api/health`.
 - Requests with non-loopback `Host` headers or disallowed `Origin` headers are rejected with `403 Forbidden`.
+
+## Desktop Packaging & Sidecar Build Limitations
+
+- **Linux Native Packaging Prerequisites**: Compiling the native Tauri desktop frontend into `.deb` or `AppImage` packages requires system development libraries: `libgtk-3-dev` (providing `gdk-3.0`), `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, and `librsvg2-dev`. On headless servers or environments lacking these libraries, `gdk-sys` build scripts fail.
+- **Standalone Daemon & Web UI**: The KernLock security core, daemon, CLI, and static web dashboard (`kernlock serve --ui-dir apps/desktop/dist`) do NOT require GTK or WebKit and run on any standard Linux distribution.
+- **Sidecar Target Triples**: The sidecar builder (`prepare-sidecar.mjs`) validates ELF, PE, and Mach-O headers and verifies target machine architectures (`x86_64`, `aarch64`) before placing sidecars into `src-tauri/binaries/`, refusing to mislabel binaries.
