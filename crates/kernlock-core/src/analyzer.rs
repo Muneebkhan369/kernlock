@@ -248,6 +248,7 @@ pub fn scan_file_streaming(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_scan_details(
     path: &str,
     sha256: String,
@@ -388,14 +389,7 @@ pub fn analyze_file_bytes(
     let entropy = shannon_entropy(bytes);
 
     evaluate_scan_details(
-        path,
-        sha256,
-        size_bytes,
-        file_type,
-        entropy,
-        bytes,
-        rules,
-        policy,
+        path, sha256, size_bytes, file_type, entropy, bytes, rules, policy,
     )
     .unwrap_or_else(|_| FileScanResult {
         path: path.to_string(),

@@ -164,7 +164,10 @@ impl ScanManager {
             files_skipped: 0,
             threats_found: 0,
             errors_count: 0,
-            target_paths: target_paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+            target_paths: target_paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
             threats: Vec::new(),
         };
 
@@ -282,7 +285,7 @@ impl ScanManager {
                         continue;
                     }
 
-                    if files_scanned % 10 == 0 {
+                    if files_scanned.is_multiple_of(10) {
                         self.update_progress(
                             scan_id,
                             &path_str,
@@ -330,8 +333,11 @@ impl ScanManager {
                                     }
                                 }
 
-                                let rule_ids: Vec<String> =
-                                    scan_result.matches.iter().map(|m| m.rule_id.clone()).collect();
+                                let rule_ids: Vec<String> = scan_result
+                                    .matches
+                                    .iter()
+                                    .map(|m| m.rule_id.clone())
+                                    .collect();
                                 let event = SecurityEvent {
                                     id: Uuid::new_v4(),
                                     timestamp: Utc::now(),
@@ -372,7 +378,9 @@ impl ScanManager {
                                         .matches
                                         .first()
                                         .map(|m| m.remediation.clone())
-                                        .unwrap_or_else(|| "Quarantine or isolate file.".to_string()),
+                                        .unwrap_or_else(|| {
+                                            "Quarantine or isolate file.".to_string()
+                                        }),
                                 };
                                 let _ = self.storage.insert_alert(&alert);
 
@@ -451,6 +459,7 @@ impl ScanManager {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn update_progress(
         &self,
         scan_id: Uuid,

@@ -26,9 +26,9 @@ pub const ES_AUTH_RESULT_DENY: u32 = 1;
 #[repr(u32)]
 pub enum EsNewClientResult {
     Success = 0,
-    ErrNotPermitted = 1,     // Missing Full Disk Access or System Extension approval
-    ErrNotPrivileged = 2,    // Must run as root / root privilege required
-    ErrNotEntitled = 3,      // Missing com.apple.developer.endpoint-security.client entitlement
+    ErrNotPermitted = 1,  // Missing Full Disk Access or System Extension approval
+    ErrNotPrivileged = 2, // Must run as root / root privilege required
+    ErrNotEntitled = 3,   // Missing com.apple.developer.endpoint-security.client entitlement
     ErrInvalidArgument = 4,
     ErrInternal = 5,
     ErrTooManyClients = 6,

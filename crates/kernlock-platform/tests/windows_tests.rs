@@ -22,11 +22,13 @@ fn test_windows_provider_never_claims_kernel_blocking_without_driver() {
     ] {
         let caps = provider.probe_capabilities(mode);
 
-        assert_eq!(caps.kernel_blocking_available, false);
-        assert_eq!(caps.auto_quarantine_available, false);
+        assert!(!caps.kernel_blocking_available);
+        assert!(!caps.auto_quarantine_available);
         assert_eq!(caps.active_mode, SecurityMode::Audit);
 
-        let fallback = caps.fallback_reason.expect("Fallback reason must be present");
+        let fallback = caps
+            .fallback_reason
+            .expect("Fallback reason must be present");
         assert!(fallback.contains(FILTER_PORT_NAME));
         assert!(fallback.contains("kernlock_filter.sys"));
         assert!(fallback.contains("unavailable"));
@@ -37,8 +39,8 @@ fn test_windows_provider_never_claims_kernel_blocking_without_driver() {
             .iter()
             .find(|c| c.name.contains("FLTMGR"))
             .expect("FLTMGR capability status must exist");
-        assert_eq!(fltmgr_cap.supported, false);
-        assert_eq!(fltmgr_cap.enforcement_available, false);
+        assert!(!fltmgr_cap.supported);
+        assert!(!fltmgr_cap.enforcement_available);
         assert!(fltmgr_cap.active_mode.contains("Unavailable"));
     }
 }

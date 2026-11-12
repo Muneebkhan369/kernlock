@@ -19,7 +19,11 @@ pub fn inspect_pe(path: &str, bytes: &[u8]) -> Option<PeInspection> {
     }
 
     let coff_offset = pe_offset + 4;
-    let machine_raw = u16::from_le_bytes(bytes[coff_offset..coff_offset + 2].try_into().unwrap_or([0; 2]));
+    let machine_raw = u16::from_le_bytes(
+        bytes[coff_offset..coff_offset + 2]
+            .try_into()
+            .unwrap_or([0; 2]),
+    );
     let machine = match machine_raw {
         0x014c => "x86 (32-bit)",
         0x8664 => "x64 (AMD64)",
@@ -28,8 +32,16 @@ pub fn inspect_pe(path: &str, bytes: &[u8]) -> Option<PeInspection> {
         _ => "Unknown PE Architecture",
     };
 
-    let num_sections = u16::from_le_bytes(bytes[coff_offset + 2..coff_offset + 4].try_into().unwrap_or([0; 2])) as usize;
-    let opt_header_size = u16::from_le_bytes(bytes[coff_offset + 16..coff_offset + 18].try_into().unwrap_or([0; 2])) as usize;
+    let num_sections = u16::from_le_bytes(
+        bytes[coff_offset + 2..coff_offset + 4]
+            .try_into()
+            .unwrap_or([0; 2]),
+    ) as usize;
+    let opt_header_size = u16::from_le_bytes(
+        bytes[coff_offset + 16..coff_offset + 18]
+            .try_into()
+            .unwrap_or([0; 2]),
+    ) as usize;
 
     let mut anomalies = Vec::new();
     let sections_start = coff_offset + 20 + opt_header_size;
@@ -38,8 +50,12 @@ pub fn inspect_pe(path: &str, bytes: &[u8]) -> Option<PeInspection> {
         for i in 0..num_sections.min(32) {
             let s_off = sections_start + i * 40;
             let name_raw = &bytes[s_off..s_off + 8];
-            let name = String::from_utf8_lossy(name_raw).trim_matches('\0').trim().to_lowercase();
-            let characteristics = u32::from_le_bytes(bytes[s_off + 36..s_off + 40].try_into().unwrap_or([0; 4]));
+            let name = String::from_utf8_lossy(name_raw)
+                .trim_matches('\0')
+                .trim()
+                .to_lowercase();
+            let characteristics =
+                u32::from_le_bytes(bytes[s_off + 36..s_off + 40].try_into().unwrap_or([0; 4]));
 
             // W+X section: IMAGE_SCN_MEM_EXECUTE (0x20000000) | IMAGE_SCN_MEM_WRITE (0x80000000)
             if (characteristics & 0xA0000000) == 0xA0000000 {

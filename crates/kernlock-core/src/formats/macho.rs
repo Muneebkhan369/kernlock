@@ -43,7 +43,8 @@ pub fn inspect_macho(path: &str, bytes: &[u8]) -> Option<MachoInspection> {
             severity: Severity::Medium,
             score: 50,
             category: EventCategory::File,
-            explanation: "Mach-O file header is shorter than the minimum expected 32 bytes.".to_string(),
+            explanation: "Mach-O file header is shorter than the minimum expected 32 bytes."
+                .to_string(),
             evidence: format!("path={}, size={}", path, bytes.len()),
             remediation: "Inspect whether file was truncated during transmission.".to_string(),
         });

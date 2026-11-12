@@ -19,11 +19,13 @@ fn test_macos_provider_never_claims_kernel_blocking_without_system_extension() {
     ] {
         let caps = provider.probe_capabilities(mode);
 
-        assert_eq!(caps.kernel_blocking_available, false);
-        assert_eq!(caps.auto_quarantine_available, false);
+        assert!(!caps.kernel_blocking_available);
+        assert!(!caps.auto_quarantine_available);
         assert_eq!(caps.active_mode, SecurityMode::Audit);
 
-        let fallback = caps.fallback_reason.expect("Fallback reason must be present");
+        let fallback = caps
+            .fallback_reason
+            .expect("Fallback reason must be present");
         assert!(fallback.contains("Endpoint Security"));
         assert!(fallback.contains("unavailable"));
 
@@ -33,8 +35,8 @@ fn test_macos_provider_never_claims_kernel_blocking_without_system_extension() {
             .iter()
             .find(|c| c.name.contains("Endpoint Security"))
             .expect("Endpoint Security capability must exist");
-        assert_eq!(esf_cap.supported, false);
-        assert_eq!(esf_cap.enforcement_available, false);
+        assert!(!esf_cap.supported);
+        assert!(!esf_cap.enforcement_available);
         assert!(esf_cap.active_mode.contains("Unavailable"));
     }
 }
@@ -65,19 +67,19 @@ fn test_macos_endpoint_security_verdict_evaluation() {
     let threat_resp = client.evaluate_auth_exec(&event, SecurityMode::Protection, true);
     assert_eq!(threat_resp.message_id, 2002);
     assert_eq!(threat_resp.result, ES_AUTH_RESULT_DENY);
-    assert_eq!(threat_resp.cache, false);
+    assert!(!threat_resp.cache);
 
     // Protection mode + clean file -> Allow execution, cache decision
     let clean_resp = client.evaluate_auth_exec(&event, SecurityMode::Protection, false);
     assert_eq!(clean_resp.message_id, 2002);
     assert_eq!(clean_resp.result, ES_AUTH_RESULT_ALLOW);
-    assert_eq!(clean_resp.cache, true);
+    assert!(clean_resp.cache);
 
     // Audit mode + threat detected -> Allow execution (Audit only), do not cache
     let audit_resp = client.evaluate_auth_exec(&event, SecurityMode::Audit, true);
     assert_eq!(audit_resp.message_id, 2002);
     assert_eq!(audit_resp.result, ES_AUTH_RESULT_ALLOW);
-    assert_eq!(audit_resp.cache, false);
+    assert!(!audit_resp.cache);
 
     // Verify constants
     assert_eq!(ES_EVENT_TYPE_AUTH_EXEC, 0);

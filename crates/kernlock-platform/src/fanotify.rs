@@ -105,7 +105,10 @@ impl FanotifyPermissionMonitor {
             }
         }
 
-        info!("Fanotify kernel execution blocking monitor initialized (fd: {})", fd);
+        info!(
+            "Fanotify kernel execution blocking monitor initialized (fd: {})",
+            fd
+        );
         Ok(Self {
             fanotify_fd: fd,
             is_running: Arc::new(AtomicBool::new(false)),
@@ -177,7 +180,9 @@ impl FanotifyPermissionMonitor {
                         &*(buf[offset..].as_ptr() as *const libc::fanotify_event_metadata)
                     };
 
-                    if metadata.event_len < std::mem::size_of::<libc::fanotify_event_metadata>() as u32 {
+                    if metadata.event_len
+                        < std::mem::size_of::<libc::fanotify_event_metadata>() as u32
+                    {
                         break;
                     }
 
@@ -187,13 +192,7 @@ impl FanotifyPermissionMonitor {
                     if event_fd >= 0 {
                         let policy = get_policy();
                         let decision = Self::evaluate_event(
-                            event_fd,
-                            event_pid,
-                            self_pid,
-                            &vault_dir,
-                            &policy,
-                            &rules,
-                            &on_threat,
+                            event_fd, event_pid, self_pid, &vault_dir, &policy, &rules, &on_threat,
                         );
 
                         let response = libc::fanotify_response {
@@ -279,10 +278,7 @@ impl FanotifyPermissionMonitor {
                 if res.is_suspicious || res.risk_score >= policy.auto_quarantine_threshold {
                     warn!(
                         "fanotify BLOCKED: {} (pid: {}, risk: {}, threat: {:?})",
-                        path_str,
-                        event_pid,
-                        res.risk_score,
-                        res.threat_name
+                        path_str, event_pid, res.risk_score, res.threat_name
                     );
 
                     let event = SecurityEvent {
@@ -319,7 +315,8 @@ impl FanotifyPermissionMonitor {
                         target: path_str.to_string(),
                         risk_score: res.risk_score,
                         status: AlertStatus::Open,
-                        recommended_action: "Quarantine file and inspect the invoking process.".to_string(),
+                        recommended_action: "Quarantine file and inspect the invoking process."
+                            .to_string(),
                     };
 
                     on_threat(event, alert);

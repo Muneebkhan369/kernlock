@@ -169,10 +169,7 @@ pub fn build_router(
         .route("/api/policy", get(get_policy).put(update_policy))
         .route("/api/rules", get(list_rules))
         .route("/api/definitions/status", get(get_definitions_status))
-        .route(
-            "/api/definitions/update",
-            post(update_definitions_endpoint),
-        )
+        .route("/api/definitions/update", post(update_definitions_endpoint))
         .route("/api/report", get(get_report))
         .route("/api/report/markdown", get(get_report_markdown))
         .route_layer(middleware::from_fn_with_state(

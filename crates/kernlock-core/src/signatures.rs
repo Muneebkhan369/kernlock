@@ -25,7 +25,8 @@ pub const KNOWN_HASH_SIGNATURES: &[HashSignature] = &[
         name: "EICAR-Standard-AV-Test-File",
         severity: Severity::Critical,
         score: 100,
-        explanation: "Matches the exact SHA-256 hash of the industry-standard EICAR antivirus test file.",
+        explanation:
+            "Matches the exact SHA-256 hash of the industry-standard EICAR antivirus test file.",
     },
     // Standard EICAR Antivirus Test File with CRLF (69 bytes)
     HashSignature {
@@ -161,5 +162,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }

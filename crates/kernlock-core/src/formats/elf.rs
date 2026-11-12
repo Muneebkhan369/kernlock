@@ -85,9 +85,13 @@ pub fn inspect_elf(path: &str, bytes: &[u8]) -> Option<ElfInspection> {
                         u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap_or([0; 4]))
                     };
                     let p_flags = if is_little_endian {
-                        u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap_or([0; 4]))
+                        u32::from_le_bytes(
+                            bytes[offset + 4..offset + 8].try_into().unwrap_or([0; 4]),
+                        )
                     } else {
-                        u32::from_be_bytes(bytes[offset + 4..offset + 8].try_into().unwrap_or([0; 4]))
+                        u32::from_be_bytes(
+                            bytes[offset + 4..offset + 8].try_into().unwrap_or([0; 4]),
+                        )
                     };
 
                     // PT_LOAD = 1, PF_X = 1, PF_W = 2 => (p_flags & 3) == 3 is W+X

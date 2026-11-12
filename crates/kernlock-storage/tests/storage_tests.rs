@@ -1,8 +1,8 @@
 use chrono::Utc;
 use kernlock_core::{
-    AlertStatus, DetectionConfidence, EventCategory, FileScanResult, PolicyConfig, QuarantineRecord,
-    QuarantineStatus, ScanJobSummary, ScanMode, ScanStatus, SecurityEvent, SecurityMode, Severity,
-    ThreatAlert, ThreatRecord,
+    AlertStatus, DetectionConfidence, EventCategory, FileScanResult, PolicyConfig,
+    QuarantineRecord, QuarantineStatus, ScanJobSummary, ScanMode, ScanStatus, SecurityEvent,
+    SecurityMode, Severity, ThreatAlert, ThreatRecord,
 };
 use kernlock_storage::Storage;
 use uuid::Uuid;
@@ -64,9 +64,11 @@ fn test_policy_storage() {
     let default_policy = storage.get_policy().expect("get default policy");
     assert_eq!(default_policy.mode, SecurityMode::Audit);
 
-    let mut custom_policy = PolicyConfig::default();
-    custom_policy.mode = SecurityMode::Strict;
-    custom_policy.auto_quarantine_threshold = 95;
+    let mut custom_policy = PolicyConfig {
+        mode: SecurityMode::Strict,
+        auto_quarantine_threshold: 95,
+        ..Default::default()
+    };
     custom_policy
         .excluded_paths
         .push("/var/log/syslog".to_string());
@@ -193,7 +195,9 @@ fn test_threat_history_storage() {
     storage
         .insert_threat_record(&record)
         .expect("insert threat record");
-    let list = storage.list_threat_records(10).expect("list threat history");
+    let list = storage
+        .list_threat_records(10)
+        .expect("list threat history");
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, t_id);
     assert_eq!(list[0].threat_name, "ELF.W+X-Segment");

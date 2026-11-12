@@ -7,7 +7,9 @@ use kernlock_core::{
     QuarantineRecord, RuleEngine, SecurityEvent, SecurityMode, SecurityReport, Severity,
     SignedThreatBundle, ThreatAlert, OFFICIAL_PUBLIC_KEY_HEX,
 };
-use kernlock_platform::{default_provider, fanotify::FanotifyPermissionMonitor, PlatformSecurityProvider};
+use kernlock_platform::{
+    default_provider, fanotify::FanotifyPermissionMonitor, PlatformSecurityProvider,
+};
 use kernlock_quarantine::QuarantineManager;
 use kernlock_storage::Storage;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -172,17 +174,13 @@ impl KernLockEngine {
                 let vault_dir = engine.quarantine.vault_dir().to_path_buf();
                 let rules = engine.rules.clone();
                 let engine_for_policy = engine.clone();
-                let policy_provider = Arc::new(move || engine_for_policy.get_policy().unwrap_or_default());
+                let policy_provider =
+                    Arc::new(move || engine_for_policy.get_policy().unwrap_or_default());
 
-                monitor.start(
-                    vault_dir,
-                    policy_provider,
-                    rules,
-                    move |event, alert| {
-                        let _ = engine.storage.insert_event(&event);
-                        let _ = engine.storage.insert_alert(&alert);
-                    },
-                );
+                monitor.start(vault_dir, policy_provider, rules, move |event, alert| {
+                    let _ = engine.storage.insert_event(&event);
+                    let _ = engine.storage.insert_alert(&alert);
+                });
 
                 if let Ok(mut guard) = self.fanotify_monitor.lock() {
                     *guard = Some(monitor);

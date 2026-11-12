@@ -657,7 +657,19 @@ impl Storage {
             .optional()?;
 
         match row {
-            Some((id_s, mode_s, status_s, start_s, end_s, scanned, skipped, threats, errors, targets_s, threats_s)) => {
+            Some((
+                id_s,
+                mode_s,
+                status_s,
+                start_s,
+                end_s,
+                scanned,
+                skipped,
+                threats,
+                errors,
+                targets_s,
+                threats_s,
+            )) => {
                 let id = Uuid::parse_str(&id_s).unwrap_or_else(|_| Uuid::new_v4());
                 let mode: ScanMode = serde_json::from_str(&mode_s)?;
                 let status: ScanStatus = serde_json::from_str(&status_s)?;
@@ -714,7 +726,19 @@ impl Storage {
 
         let mut out = Vec::new();
         for r in rows {
-            let (id_s, mode_s, status_s, start_s, end_s, scanned, skipped, threats, errors, targets_s, threats_s) = r?;
+            let (
+                id_s,
+                mode_s,
+                status_s,
+                start_s,
+                end_s,
+                scanned,
+                skipped,
+                threats,
+                errors,
+                targets_s,
+                threats_s,
+            ) = r?;
             out.push(ScanJobSummary {
                 id: Uuid::parse_str(&id_s).unwrap_or_else(|_| Uuid::new_v4()),
                 mode: serde_json::from_str(&mode_s)?,

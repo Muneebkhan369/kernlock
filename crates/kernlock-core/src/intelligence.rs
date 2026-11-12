@@ -108,8 +108,8 @@ impl SignedThreatBundle {
     }
 
     pub fn verify_with_hex_key(&self, key_hex: &str) -> Result<(), IntelligenceError> {
-        let key_bytes = hex::decode(key_hex)
-            .map_err(|e| IntelligenceError::InvalidKey(e.to_string()))?;
+        let key_bytes =
+            hex::decode(key_hex).map_err(|e| IntelligenceError::InvalidKey(e.to_string()))?;
         if key_bytes.len() != 32 {
             return Err(IntelligenceError::InvalidKey(
                 "Public key must be exactly 32 bytes".to_string(),
