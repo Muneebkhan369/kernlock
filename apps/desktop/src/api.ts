@@ -23,17 +23,36 @@ const TOKEN_STORAGE_KEY = "kernlock_api_token";
 
 export function getApiToken(): string {
   if (typeof window === "undefined") return "";
-  const urlToken = new URLSearchParams(window.location.search).get("token");
-  if (urlToken) {
-    sessionStorage.setItem(TOKEN_STORAGE_KEY, urlToken);
-    return urlToken;
-  }
   return sessionStorage.getItem(TOKEN_STORAGE_KEY) || "";
 }
 
 export function setApiToken(token: string) {
   if (typeof window !== "undefined") {
     sessionStorage.setItem(TOKEN_STORAGE_KEY, token.trim());
+  }
+}
+
+export interface DaemonLifecycleStatus {
+  running: boolean;
+  managed_by_desktop: boolean;
+  error: string | null;
+}
+
+export async function getDaemonStatus(): Promise<DaemonLifecycleStatus | null> {
+  if (!isTauri) return null;
+  try {
+    return await invoke<DaemonLifecycleStatus>("get_daemon_status");
+  } catch {
+    return null;
+  }
+}
+
+export async function restartDaemon(): Promise<DaemonLifecycleStatus | null> {
+  if (!isTauri) return null;
+  try {
+    return await invoke<DaemonLifecycleStatus>("restart_daemon");
+  } catch {
+    return null;
   }
 }
 

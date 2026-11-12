@@ -189,3 +189,32 @@ async fn api_rejects_unauthenticated_and_cross_origin_requests() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["capabilities"]["kernel_blocking_available"], false);
 }
+
+#[cfg(unix)]
+#[test]
+fn auth_token_is_created_with_0600_and_rejects_symlinks_or_permissive_modes() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let tmp = TempDir::new().unwrap();
+    let token = kernlock_daemon::auth::load_or_create_token(tmp.path()).unwrap();
+    assert!(token.len() >= 32);
+
+    let token_path = kernlock_core::paths::auth_token_path(tmp.path());
+    let mode = std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "auth.token must be created with 0600 permissions"
+    );
+
+    // Permissive mode (0644) must be rejected on subsequent load
+    std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(kernlock_daemon::auth::load_or_create_token(tmp.path()).is_err());
+
+    // Symlinked token file must be rejected
+    std::fs::remove_file(&token_path).unwrap();
+    let other = tmp.path().join("other.token");
+    std::fs::write(&other, "0123456789abcdef0123456789abcdef").unwrap();
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(&other, &token_path).unwrap();
+    assert!(kernlock_daemon::auth::load_or_create_token(tmp.path()).is_err());
+}

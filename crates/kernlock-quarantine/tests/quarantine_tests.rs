@@ -189,3 +189,127 @@ fn quarantine_rejects_symlinks_and_files_inside_vault() {
     let err = qm.quarantine_file(&vault_file, "inside").unwrap_err();
     assert!(matches!(err, QuarantineError::InsideVault(_)));
 }
+
+#[test]
+fn quarantine_returns_rollback_failed_with_recovery_info() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage).unwrap();
+
+    // 1. Rollback failure during quarantine vault_chmod
+    let target1 = tmp.path().join("stranded_chmod.bin");
+    fs::write(&target1, b"precious payload").unwrap();
+    let err1 = qm
+        .quarantine_file_with_injection(
+            &target1,
+            "test",
+            FailureInjection::PermissionChangeAndRollbackMove,
+        )
+        .unwrap_err();
+    match err1 {
+        QuarantineError::RollbackFailed(info) => {
+            assert_eq!(info.stage, "vault_chmod");
+            assert!(info.cause.contains("injected permission failure"));
+            assert!(info
+                .rollback_error
+                .contains("injected rollback move failure"));
+            assert_eq!(info.stranded_path, info.vault_path);
+            assert!(std::path::Path::new(&info.stranded_path).exists());
+            assert!(!info.sha256.is_empty());
+            assert!(info.original_path.ends_with("stranded_chmod.bin"));
+        }
+        other => panic!("Expected RollbackFailed, got {other:?}"),
+    }
+
+    // 2. Rollback failure during quarantine database_insert
+    let target2 = tmp.path().join("stranded_db.bin");
+    fs::write(&target2, b"precious payload 2").unwrap();
+    let err2 = qm
+        .quarantine_file_with_injection(
+            &target2,
+            "test",
+            FailureInjection::DatabaseWriteAndRollbackMove,
+        )
+        .unwrap_err();
+    match err2 {
+        QuarantineError::RollbackFailed(info) => assert_eq!(info.stage, "database_insert"),
+        other => panic!("Expected RollbackFailed, got {other:?}"),
+    }
+
+    // 3. Rollback failure during restore_chmod
+    let target3 = tmp.path().join("stranded_restore.bin");
+    fs::write(&target3, b"precious payload 3").unwrap();
+    let rec = qm.quarantine_file(&target3, "test").unwrap();
+    let err3 = qm
+        .restore_file_with_injection(rec.id, FailureInjection::PermissionChangeAndRollbackMove)
+        .unwrap_err();
+    match err3 {
+        QuarantineError::RollbackFailed(info) => assert_eq!(info.stage, "restore_chmod"),
+        other => panic!("Expected RollbackFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn restore_prevents_destination_overwrite_on_toctou_race() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let qm = QuarantineManager::new(tmp.path().join("vault"), storage).unwrap();
+
+    let target = tmp.path().join("raced_file.txt");
+    fs::write(&target, b"quarantined original").unwrap();
+    let rec = qm.quarantine_file(&target, "test").unwrap();
+
+    let err = qm
+        .restore_file_with_injection(rec.id, FailureInjection::DestinationRaceCreated)
+        .unwrap_err();
+    assert!(
+        matches!(err, QuarantineError::DestinationExists(_)),
+        "Expected DestinationExists on race, got {err:?}"
+    );
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"user file created during race window",
+        "Existing user file must never be overwritten"
+    );
+    assert!(
+        std::path::Path::new(&rec.vault_path).exists(),
+        "Vault copy must remain intact when restore is aborted"
+    );
+}
+
+#[test]
+fn cross_fs_copy_cleans_up_partial_staging_and_never_clobbers() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src.bin");
+    let dst = tmp.path().join("dst.bin");
+    fs::write(&src, b"source bytes").unwrap();
+
+    // 1. Injected copy failure must clean up any `.kernlock_staging_*` file and leave `src` intact
+    let err = kernlock_quarantine::cross_fs_copy_no_clobber(&src, &dst, true).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("injected cross-filesystem copy failure"));
+    assert!(src.exists());
+    assert!(!dst.exists());
+    let leftover: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".kernlock_staging_")
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "Staging file must be cleaned up on error"
+    );
+
+    // 2. Existing destination must never be overwritten
+    fs::write(&dst, b"do not overwrite").unwrap();
+    let err = kernlock_quarantine::cross_fs_copy_no_clobber(&src, &dst, false).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read(&dst).unwrap(), b"do not overwrite");
+    assert!(src.exists());
+}

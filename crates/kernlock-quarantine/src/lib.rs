@@ -2,10 +2,41 @@ use chrono::Utc;
 use kernlock_core::{sha256_hex, QuarantineRecord, QuarantineStatus};
 use kernlock_storage::{Storage, StorageError};
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
+
+#[derive(Debug)]
+pub struct RollbackFailureInfo {
+    pub stage: &'static str,
+    pub cause: String,
+    pub rollback_error: String,
+    pub stranded_path: String,
+    pub original_path: String,
+    pub vault_path: String,
+    pub sha256: String,
+    pub original_mode: u32,
+}
+
+impl std::fmt::Display for RollbackFailureInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Operation failed at stage '{}' ({}) AND rollback failed ({}); \
+             stranded file may remain at '{}'. Recovery info: original='{}', \
+             vault='{}', sha256={}, original_mode={:#o}",
+            self.stage,
+            self.cause,
+            self.rollback_error,
+            self.stranded_path,
+            self.original_path,
+            self.vault_path,
+            self.sha256,
+            self.original_mode
+        )
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum QuarantineError {
@@ -27,6 +58,8 @@ pub enum QuarantineError {
     IntegrityMismatch(String),
     #[error("Operation failed at stage '{stage}' and was safely rolled back: {cause}")]
     RolledBack { stage: &'static str, cause: String },
+    #[error("{0}")]
+    RollbackFailed(Box<RollbackFailureInfo>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +67,9 @@ pub enum FailureInjection {
     None,
     PermissionChange,
     DatabaseWrite,
+    PermissionChangeAndRollbackMove,
+    DatabaseWriteAndRollbackMove,
+    DestinationRaceCreated,
 }
 
 #[derive(Clone)]
@@ -49,9 +85,9 @@ impl QuarantineManager {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&vault, fs::Permissions::from_mode(0o700));
+            fs::set_permissions(&vault, fs::Permissions::from_mode(0o700))?;
         }
-        let canonical_vault = fs::canonicalize(&vault).unwrap_or(vault);
+        let canonical_vault = fs::canonicalize(&vault)?;
         Ok(Self {
             vault_dir: canonical_vault,
             storage,
@@ -97,7 +133,7 @@ impl QuarantineManager {
         #[cfg(unix)]
         let original_mode = {
             use std::os::unix::fs::PermissionsExt;
-            metadata.permissions().mode()
+            metadata.permissions().mode() & 0o7777
         };
         #[cfg(not(unix))]
         let original_mode = 0o644u32;
@@ -105,21 +141,61 @@ impl QuarantineManager {
         let id = Uuid::new_v4();
         let vault_path = self.vault_dir.join(format!("{}.locked", id));
 
-        move_file_safely(&canonical_orig, &vault_path)?;
+        move_file_no_clobber(&canonical_orig, &vault_path)?;
 
         // Stage 2: Set restrictive 0600 permissions inside vault; roll back move on failure.
-        let perm_res: Result<(), std::io::Error> = if inject == FailureInjection::PermissionChange {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
+        let perm_res: Result<(), io::Error> = matches!(
+            inject,
+            FailureInjection::PermissionChange | FailureInjection::PermissionChangeAndRollbackMove
+        )
+        .then(|| {
+            Err(io::Error::new(
+                ErrorKind::PermissionDenied,
                 "injected permission failure",
             ))
-        } else {
-            set_mode(&vault_path, 0o600)
-        };
+        })
+        .unwrap_or_else(|| set_mode(&vault_path, 0o600));
 
         if let Err(e) = perm_res {
-            let _ = move_file_safely(&vault_path, &canonical_orig);
-            let _ = set_mode(&canonical_orig, original_mode);
+            let rollback_move = if inject == FailureInjection::PermissionChangeAndRollbackMove {
+                Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "injected rollback move failure",
+                ))
+            } else {
+                move_file_no_clobber(&vault_path, &canonical_orig)
+            };
+
+            if let Err(rb_err) = rollback_move {
+                return Err(QuarantineError::RollbackFailed(Box::new(
+                    RollbackFailureInfo {
+                        stage: "vault_chmod",
+                        cause: e.to_string(),
+                        rollback_error: rb_err.to_string(),
+                        stranded_path: vault_path.display().to_string(),
+                        original_path: canonical_orig.display().to_string(),
+                        vault_path: vault_path.display().to_string(),
+                        sha256,
+                        original_mode,
+                    },
+                )));
+            }
+
+            if let Err(mode_err) = set_mode(&canonical_orig, original_mode) {
+                return Err(QuarantineError::RollbackFailed(Box::new(
+                    RollbackFailureInfo {
+                        stage: "vault_chmod",
+                        cause: e.to_string(),
+                        rollback_error: format!("failed to restore original mode: {mode_err}"),
+                        stranded_path: canonical_orig.display().to_string(),
+                        original_path: canonical_orig.display().to_string(),
+                        vault_path: vault_path.display().to_string(),
+                        sha256,
+                        original_mode,
+                    },
+                )));
+            }
+
             return Err(QuarantineError::RolledBack {
                 stage: "vault_chmod",
                 cause: e.to_string(),
@@ -130,7 +206,7 @@ impl QuarantineManager {
             id,
             original_path: canonical_orig.display().to_string(),
             vault_path: vault_path.display().to_string(),
-            sha256,
+            sha256: sha256.clone(),
             original_mode,
             size_bytes,
             reason: reason.to_string(),
@@ -140,7 +216,10 @@ impl QuarantineManager {
         };
 
         // Stage 3: Persist metadata in SQLite; roll back move and restore permissions on failure.
-        let db_res = if inject == FailureInjection::DatabaseWrite {
+        let db_res = if matches!(
+            inject,
+            FailureInjection::DatabaseWrite | FailureInjection::DatabaseWriteAndRollbackMove
+        ) {
             Err(StorageError::NotFound(
                 "injected database write failure".to_string(),
             ))
@@ -149,8 +228,37 @@ impl QuarantineManager {
         };
 
         if let Err(e) = db_res {
-            let _ = set_mode(&vault_path, original_mode);
-            let _ = move_file_safely(&vault_path, &canonical_orig);
+            let rollback_res: Result<(), String> = (|| {
+                if inject == FailureInjection::DatabaseWriteAndRollbackMove {
+                    return Err("injected rollback move failure".to_string());
+                }
+                move_file_no_clobber(&vault_path, &canonical_orig)
+                    .map_err(|err| format!("move back failed: {err}"))?;
+                set_mode(&canonical_orig, original_mode)
+                    .map_err(|err| format!("restore mode failed: {err}"))?;
+                Ok(())
+            })();
+
+            if let Err(rb_err) = rollback_res {
+                let stranded = if vault_path.exists() {
+                    &vault_path
+                } else {
+                    &canonical_orig
+                };
+                return Err(QuarantineError::RollbackFailed(Box::new(
+                    RollbackFailureInfo {
+                        stage: "database_insert",
+                        cause: e.to_string(),
+                        rollback_error: rb_err,
+                        stranded_path: stranded.display().to_string(),
+                        original_path: canonical_orig.display().to_string(),
+                        vault_path: vault_path.display().to_string(),
+                        sha256,
+                        original_mode,
+                    },
+                )));
+            }
+
             return Err(QuarantineError::RolledBack {
                 stage: "database_insert",
                 cause: e.to_string(),
@@ -200,20 +308,66 @@ impl QuarantineManager {
             fs::create_dir_all(parent)?;
         }
 
-        move_file_safely(&vault_path, &orig_path)?;
+        // Simulate a TOCTOU race where a user file is created at `orig_path`
+        // after our initial `symlink_metadata` check and before the atomic move.
+        if inject == FailureInjection::DestinationRaceCreated {
+            fs::write(&orig_path, b"user file created during race window")?;
+        }
 
-        let perm_res: Result<(), std::io::Error> = if inject == FailureInjection::PermissionChange {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
+        match move_file_no_clobber(&vault_path, &orig_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                return Err(QuarantineError::DestinationExists(
+                    record.original_path.clone(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        let perm_res: Result<(), io::Error> = matches!(
+            inject,
+            FailureInjection::PermissionChange | FailureInjection::PermissionChangeAndRollbackMove
+        )
+        .then(|| {
+            Err(io::Error::new(
+                ErrorKind::PermissionDenied,
                 "injected restore permission failure",
             ))
-        } else {
-            set_mode(&orig_path, record.original_mode)
-        };
+        })
+        .unwrap_or_else(|| set_mode(&orig_path, record.original_mode));
 
         if let Err(e) = perm_res {
-            let _ = move_file_safely(&orig_path, &vault_path);
-            let _ = set_mode(&vault_path, 0o600);
+            let rollback_res: Result<(), String> = (|| {
+                if inject == FailureInjection::PermissionChangeAndRollbackMove {
+                    return Err("injected restore rollback move failure".to_string());
+                }
+                move_file_no_clobber(&orig_path, &vault_path)
+                    .map_err(|err| format!("move back to vault failed: {err}"))?;
+                set_mode(&vault_path, 0o600)
+                    .map_err(|err| format!("re-lock vault mode failed: {err}"))?;
+                Ok(())
+            })();
+
+            if let Err(rb_err) = rollback_res {
+                let stranded = if orig_path.exists() {
+                    &orig_path
+                } else {
+                    &vault_path
+                };
+                return Err(QuarantineError::RollbackFailed(Box::new(
+                    RollbackFailureInfo {
+                        stage: "restore_chmod",
+                        cause: e.to_string(),
+                        rollback_error: rb_err,
+                        stranded_path: stranded.display().to_string(),
+                        original_path: record.original_path.clone(),
+                        vault_path: record.vault_path.clone(),
+                        sha256: record.sha256.clone(),
+                        original_mode: record.original_mode,
+                    },
+                )));
+            }
+
             return Err(QuarantineError::RolledBack {
                 stage: "restore_chmod",
                 cause: e.to_string(),
@@ -221,7 +375,10 @@ impl QuarantineManager {
         }
 
         let now = Utc::now();
-        let db_res = if inject == FailureInjection::DatabaseWrite {
+        let db_res = if matches!(
+            inject,
+            FailureInjection::DatabaseWrite | FailureInjection::DatabaseWriteAndRollbackMove
+        ) {
             Err(StorageError::NotFound(
                 "injected restore db failure".to_string(),
             ))
@@ -231,8 +388,36 @@ impl QuarantineManager {
         };
 
         if let Err(e) = db_res {
-            let _ = set_mode(&orig_path, 0o600);
-            let _ = move_file_safely(&orig_path, &vault_path);
+            let rollback_res: Result<(), String> = (|| {
+                if inject == FailureInjection::DatabaseWriteAndRollbackMove {
+                    return Err("injected restore db rollback move failure".to_string());
+                }
+                set_mode(&orig_path, 0o600).map_err(|err| format!("re-lock mode failed: {err}"))?;
+                move_file_no_clobber(&orig_path, &vault_path)
+                    .map_err(|err| format!("move back to vault failed: {err}"))?;
+                Ok(())
+            })();
+
+            if let Err(rb_err) = rollback_res {
+                let stranded = if orig_path.exists() {
+                    &orig_path
+                } else {
+                    &vault_path
+                };
+                return Err(QuarantineError::RollbackFailed(Box::new(
+                    RollbackFailureInfo {
+                        stage: "restore_db_update",
+                        cause: e.to_string(),
+                        rollback_error: rb_err,
+                        stranded_path: stranded.display().to_string(),
+                        original_path: record.original_path.clone(),
+                        vault_path: record.vault_path.clone(),
+                        sha256: record.sha256.clone(),
+                        original_mode: record.original_mode,
+                    },
+                )));
+            }
+
             return Err(QuarantineError::RolledBack {
                 stage: "restore_db_update",
                 cause: e.to_string(),
@@ -263,7 +448,7 @@ impl QuarantineManager {
     }
 }
 
-fn read_regular_nofollow(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+fn read_regular_nofollow(path: &Path) -> io::Result<Vec<u8>> {
     let mut opts = OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -278,26 +463,176 @@ fn read_regular_nofollow(path: &Path) -> Result<Vec<u8>, std::io::Error> {
 }
 
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> Result<(), std::io::Error> {
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> Result<(), std::io::Error> {
+fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn move_file_safely(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
-    match fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // Cross-filesystem fallback: copy, fsync, then remove source
-            fs::copy(src, dst)?;
-            let file = fs::File::open(dst)?;
-            file.sync_all()?;
-            fs::remove_file(src)?;
-            Ok(())
+/// Atomically move `src` to `dst` without ever overwriting an existing `dst`.
+///
+/// Uses kernel-level `RENAME_NOREPLACE` (Linux) / `RENAME_EXCL` (macOS) when
+/// supported, falls back to atomic `hard_link` + `remove_file` when needed,
+/// and performs a staged no-clobber copy with cleanup on cross-device moves (`EXDEV`).
+pub fn move_file_no_clobber(src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_src = CString::new(src.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "NUL byte in source path"))?;
+        let c_dst = CString::new(dst.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "NUL byte in destination path"))?;
+        let rc = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                c_src.as_ptr(),
+                libc::AT_FDCWD,
+                c_dst.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EEXIST) => Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!("Destination already exists: {}", dst.display()),
+            )),
+            Some(libc::EXDEV) => cross_fs_copy_no_clobber(src, dst, false),
+            Some(libc::ENOSYS) | Some(libc::EINVAL) => hard_link_or_cross_fs(src, dst),
+            _ => Err(err),
         }
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_src = CString::new(src.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "NUL byte in source path"))?;
+        let c_dst = CString::new(dst.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "NUL byte in destination path"))?;
+        let rc = unsafe { libc::renamex_np(c_src.as_ptr(), c_dst.as_ptr(), libc::RENAME_EXCL) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EEXIST) => Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!("Destination already exists: {}", dst.display()),
+            )),
+            Some(libc::EXDEV) => cross_fs_copy_no_clobber(src, dst, false),
+            Some(libc::ENOTSUP) => hard_link_or_cross_fs(src, dst),
+            _ => Err(err),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        hard_link_or_cross_fs(src, dst)
+    }
+}
+
+fn hard_link_or_cross_fs(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::hard_link(src, dst) {
+        Ok(()) => {
+            if let Err(e) = fs::remove_file(src) {
+                let _ = fs::remove_file(dst);
+                return Err(e);
+            }
+            Ok(())
+        }
+        Err(e) if is_cross_device_error(&e) => cross_fs_copy_no_clobber(src, dst, false),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_cross_device_error(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::EXDEV) {
+        return true;
+    }
+    #[cfg(windows)]
+    if err.raw_os_error() == Some(17) {
+        // ERROR_NOT_SAME_DEVICE
+        return true;
+    }
+    err.kind() == ErrorKind::CrossesDevices
+}
+
+/// Perform a staged cross-filesystem copy to `dst` without overwriting an existing `dst`.
+///
+/// Always cleans up the temporary staging file on any error (including injected copy failure).
+pub fn cross_fs_copy_no_clobber(
+    src: &Path,
+    dst: &Path,
+    inject_copy_failure: bool,
+) -> io::Result<()> {
+    let parent = dst.parent().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("Destination has no parent directory: {}", dst.display()),
+        )
+    })?;
+    let tmp_path = parent.join(format!(".kernlock_staging_{}", Uuid::new_v4()));
+
+    let copy_res = (|| -> io::Result<()> {
+        let mut src_opts = OpenOptions::new();
+        src_opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            src_opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut src_file = src_opts.open(src)?;
+
+        let mut dst_opts = OpenOptions::new();
+        dst_opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            dst_opts.mode(0o600);
+        }
+        let mut tmp_file = dst_opts.open(&tmp_path)?;
+
+        if inject_copy_failure {
+            use std::io::Write;
+            tmp_file.write_all(b"partial")?;
+            return Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "injected cross-filesystem copy failure",
+            ));
+        }
+
+        io::copy(&mut src_file, &mut tmp_file)?;
+        tmp_file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = copy_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // Atomically publish staging file to `dst` without clobbering any existing file.
+    if let Err(e) = fs::hard_link(&tmp_path, dst) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    let _ = fs::remove_file(&tmp_path);
+
+    if let Err(e) = fs::remove_file(src) {
+        let _ = fs::remove_file(dst);
+        return Err(e);
+    }
+
+    Ok(())
 }

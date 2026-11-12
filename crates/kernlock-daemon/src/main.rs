@@ -58,16 +58,6 @@ enum QuarantineAction {
     Delete { id: Uuid },
 }
 
-fn default_data_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        return PathBuf::from(xdg).join("kernlock");
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".local/share/kernlock");
-    }
-    PathBuf::from(".kernlock")
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -78,7 +68,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let data_dir = cli.data_dir.unwrap_or_else(default_data_dir);
+    let data_dir = cli
+        .data_dir
+        .unwrap_or_else(kernlock_core::paths::default_data_dir);
     let engine = KernLockEngine::init(&data_dir)?;
 
     match cli.command {

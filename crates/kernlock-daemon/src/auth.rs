@@ -1,5 +1,7 @@
 use anyhow::Result;
-use std::fs;
+use kernlock_core::paths::{auth_token_path, read_validated_token_file};
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -15,23 +17,67 @@ pub fn load_or_create_token<P: AsRef<Path>>(data_dir: P) -> Result<String> {
         }
     }
 
-    let token_path = data_dir.as_ref().join("auth.token");
-    if token_path.exists() {
-        let existing = fs::read_to_string(&token_path)?.trim().to_string();
-        if existing.len() >= 32 {
-            return Ok(existing);
-        }
+    let dir = data_dir.as_ref();
+    let token_path = auth_token_path(dir);
+
+    if fs::symlink_metadata(&token_path).is_ok() {
+        return Ok(read_validated_token_file(&token_path)?);
     }
 
-    fs::create_dir_all(data_dir.as_ref())?;
-    let token = generate_token();
-    fs::write(&token_path, &token)?;
+    fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
-    Ok(token)
+
+    let token = generate_token();
+    let tmp_path = dir.join(format!(".auth.token.tmp.{}", Uuid::new_v4()));
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+
+    match fs::hard_link(&tmp_path, &token_path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&tmp_path);
+            Ok(read_validated_token_file(&token_path)?)
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&tmp_path);
+            Ok(read_validated_token_file(&token_path)?)
+        }
+        Err(e) => {
+            // Fallback for filesystems where hard links are unsupported: rename if not already present.
+            if fs::symlink_metadata(&token_path).is_ok() {
+                let _ = fs::remove_file(&tmp_path);
+                return Ok(read_validated_token_file(&token_path)?);
+            }
+            if let Err(rename_err) = fs::rename(&tmp_path, &token_path) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(anyhow::anyhow!(
+                    "Failed to publish token file ({e}; rename fallback: {rename_err})"
+                ));
+            }
+            Ok(read_validated_token_file(&token_path)?)
+        }
+    }
 }
 
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

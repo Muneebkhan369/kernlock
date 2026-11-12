@@ -11,7 +11,7 @@ import {
   Shield,
   Terminal,
 } from "lucide-react";
-import { api, getApiToken, setApiToken } from "./api";
+import { api, getApiToken, getDaemonStatus, restartDaemon, setApiToken } from "./api";
 import type {
   CommandAnalysisResult,
   DetectionRuleDef,
@@ -78,7 +78,12 @@ export default function App() {
       setEvents(e);
       setQuarantine(q);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const daemonState = await getDaemonStatus();
+      if (daemonState && !daemonState.running && daemonState.error) {
+        setError(`Daemon unavailable: ${daemonState.error}`);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
   }
 
@@ -113,7 +118,12 @@ export default function App() {
         setReportMd(md);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const daemonState = await getDaemonStatus();
+      if (daemonState && !daemonState.running && daemonState.error) {
+        setError(`Daemon unavailable: ${daemonState.error}`);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setLoading(false);
     }
@@ -126,7 +136,12 @@ export default function App() {
       setPolicyDraft(updated);
       await refreshOverview();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const daemonState = await getDaemonStatus();
+      if (daemonState && !daemonState.running && daemonState.error) {
+        setError(`Daemon unavailable: ${daemonState.error}`);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
   }
 
@@ -138,7 +153,12 @@ export default function App() {
       setScanResults(res);
       await refreshOverview();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const daemonState = await getDaemonStatus();
+      if (daemonState && !daemonState.running && daemonState.error) {
+        setError(`Daemon unavailable: ${daemonState.error}`);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setLoading(false);
     }
@@ -153,7 +173,12 @@ export default function App() {
       setCmdResult(res);
       await refreshOverview();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const daemonState = await getDaemonStatus();
+      if (daemonState && !daemonState.running && daemonState.error) {
+        setError(`Daemon unavailable: ${daemonState.error}`);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setLoading(false);
     }
@@ -167,7 +192,12 @@ export default function App() {
         setScanResults((prev) => prev.filter((item) => item.path !== path));
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const daemonState = await getDaemonStatus();
+      if (daemonState && !daemonState.running && daemonState.error) {
+        setError(`Daemon unavailable: ${daemonState.error}`);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
   }
 
@@ -177,7 +207,12 @@ export default function App() {
       setQuarantine(await api.getQuarantine());
       await refreshOverview();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const daemonState = await getDaemonStatus();
+      if (daemonState && !daemonState.running && daemonState.error) {
+        setError(`Daemon unavailable: ${daemonState.error}`);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
   }
 
@@ -186,7 +221,12 @@ export default function App() {
       await api.deleteQuarantine(id);
       setQuarantine(await api.getQuarantine());
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const daemonState = await getDaemonStatus();
+      if (daemonState && !daemonState.running && daemonState.error) {
+        setError(`Daemon unavailable: ${daemonState.error}`);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
   }
 
@@ -197,7 +237,12 @@ export default function App() {
       setPolicyDraft(saved);
       await refreshOverview();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const daemonState = await getDaemonStatus();
+      if (daemonState && !daemonState.running && daemonState.error) {
+        setError(`Daemon unavailable: ${daemonState.error}`);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
   }
 
@@ -274,7 +319,9 @@ export default function App() {
           <div className="card" style={{ marginBottom: 16 }}>
             <h3 style={{ marginTop: 0 }}>Daemon API Authentication</h3>
             <p style={{ color: "var(--muted)", fontSize: "0.88rem" }}>
-              Enter the local Bearer token from <code>~/.local/share/kernlock/auth.token</code> (or pass <code>?token=...</code> in dev mode).
+              Enter the local Bearer token from <code>auth.token</code> inside your KernLock data directory
+              (e.g. <code>~/.local/share/kernlock/auth.token</code> on Linux, <code>%LOCALAPPDATA%\kernlock\auth.token</code> on Windows,
+              or <code>~/Library/Application Support/kernlock/auth.token</code> on macOS).
             </p>
             <div className="row">
               <input
@@ -293,6 +340,15 @@ export default function App() {
                 }}
               >
                 Connect
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={async () => {
+                  await restartDaemon();
+                  await refreshOverview();
+                }}
+              >
+                Retry Daemon
               </button>
             </div>
           </div>

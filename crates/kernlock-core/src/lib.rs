@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod models;
+pub mod paths;
 pub mod rules;
 
 pub use analyzer::{
