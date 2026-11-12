@@ -4,10 +4,17 @@
   "version": "0.1.0",
   "identifier": "io.kernlock.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "node scripts/prepare-sidecar.mjs && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "node scripts/prepare-sidecar.mjs --release && npm run build",
     "frontendDist": "../dist"
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": [
+      "binaries/kernlock"
+    ]
   },
   "app": {
     "windows": [

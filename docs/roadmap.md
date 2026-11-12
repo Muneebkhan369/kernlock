@@ -22,6 +22,13 @@
 - [x] Unified cross-platform data-directory & `auth.token` resolution in `kernlock-core::paths` (`XDG_DATA_HOME`, `LOCALAPPDATA`, `Application Support`), atomic `0600` creation, and symlink/permission validation
 - [x] Tauri 2 daemon lifecycle management (health probe, duplicate-instance reuse, startup error reporting, clean shutdown) with zero URL token exposure
 
+## Phase 1.3 — Packaging, Recovery & Cross-Platform Validation (Completed)
+- [x] Database-safe permanent deletion via recoverable `Deleting` state, staged `.deleting_<id>.locked` payload, and `CleanupFailed` structured recovery reporting
+- [x] Zero ignored filesystem cleanup failures in `hard_link_or_cross_fs`, `cross_fs_copy_no_clobber`, and `delete_permanently_with_injection`
+- [x] Tauri 2 `externalBin` sidecar bundling (`scripts/prepare-sidecar.mjs`, `tauri.conf.json`) for Linux, Windows, and macOS without requiring `PATH` installation
+- [x] Authenticated `/api/status` daemon probe in Tauri rejecting spoofed/unrelated services on port 17420
+- [x] Atomic `O_CREAT | O_EXCL` (`create_new`) token creation without overwrite fallbacks and `>= 32`-char `KERNLOCK_API_TOKEN` validation
+
 ## Phase 2 — Privileged Linux Enforcement & YARA/Sigma Parity
 - [ ] Privileged `fanotify` (`FAN_OPEN_PERM`) helper daemon with PolicyKit/sudo privilege separation
 - [ ] Optional `libyara` / `yara-x` integration for native `.yar` rule files

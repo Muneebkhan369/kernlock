@@ -1,11 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use kernlock_core::paths::{auth_token_path, default_data_dir, read_validated_token_file};
+use kernlock_core::paths::{
+    auth_token_path, default_data_dir, probe_authenticated_daemon, read_validated_token_file,
+    validate_env_token, DaemonProbeResult,
+};
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -46,52 +47,128 @@ fn daemon_binary_name() -> &'static str {
     }
 }
 
-fn locate_daemon_binary() -> PathBuf {
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (meta.permissions().mode() & 0o111) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Locate the bundled Tauri sidecar binary without relying on user `PATH`.
+fn locate_bundled_daemon() -> Result<PathBuf, String> {
     let bin_name = daemon_binary_name();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join(bin_name);
-            if sibling.is_file() {
-                return sibling;
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Failed to resolve current executable path: {e}"))?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| "Desktop executable has no parent directory".to_string())?;
+
+    // 1. Standard Tauri 2 installed sidecar location: sibling `kernlock` / `kernlock.exe`.
+    let sibling = exe_dir.join(bin_name);
+    if sibling.exists() {
+        if is_executable_file(&sibling) {
+            return Ok(sibling);
+        }
+        return Err(format!(
+            "Bundled KernLock daemon at {} is not executable",
+            sibling.display()
+        ));
+    }
+
+    // 2. Fallback for unbundled `cargo run`: `binaries/kernlock-*` next to executable or in src-tauri.
+    let binaries_dir = exe_dir.join("binaries");
+    if let Ok(entries) = fs::read_dir(&binaries_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("kernlock-"))
+                && is_executable_file(&p)
+            {
+                return Ok(p);
             }
         }
     }
-    PathBuf::from(bin_name)
+
+    Err(format!(
+        "Bundled KernLock daemon binary ({}) not found next to {}",
+        bin_name,
+        exe.display()
+    ))
 }
 
-fn probe_daemon_health(port: u16) -> bool {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-    let req = format!(
-        "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
-    if stream.write_all(req.as_bytes()).is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 512];
-    match stream.read(&mut buf) {
-        Ok(n) if n > 0 => {
-            let text = String::from_utf8_lossy(&buf[..n]);
-            text.contains("200 OK") && text.contains("kernlockd")
+fn load_configured_token() -> Result<Option<String>, String> {
+    if let Ok(env_token) = std::env::var("KERNLOCK_API_TOKEN") {
+        match validate_env_token(&env_token) {
+            Ok(Some(valid)) => return Ok(Some(valid)),
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
         }
-        _ => false,
     }
+    let token_path = auth_token_path(default_data_dir());
+    if fs::symlink_metadata(&token_path).is_ok() {
+        let tok = read_validated_token_file(&token_path).map_err(|e| e.to_string())?;
+        return Ok(Some(tok));
+    }
+    Ok(None)
+}
+
+fn set_status(state: &DaemonState, status: DaemonStatus) -> DaemonStatus {
+    *state.status.lock().unwrap() = status.clone();
+    status
 }
 
 fn ensure_daemon_running(state: &DaemonState) -> DaemonStatus {
-    // 1. Prevent duplicate daemon instances: reuse an already-healthy daemon.
-    if probe_daemon_health(DAEMON_PORT) {
-        let status = DaemonStatus {
-            running: true,
-            managed_by_desktop: false,
-            error: None,
-        };
-        *state.status.lock().unwrap() = status.clone();
-        return status;
+    let existing_token = match load_configured_token() {
+        Ok(tok) => tok,
+        Err(e) => {
+            return set_status(
+                state,
+                DaemonStatus {
+                    running: false,
+                    managed_by_desktop: false,
+                    error: Some(format!("Invalid local API token configuration: {e}")),
+                },
+            );
+        }
+    };
+
+    // 1. Verify port 17420 with an authenticated /api/status probe (never trust /api/health alone).
+    match probe_authenticated_daemon(DAEMON_PORT, existing_token.as_deref()) {
+        DaemonProbeResult::AuthenticatedKernLock => {
+            return set_status(
+                state,
+                DaemonStatus {
+                    running: true,
+                    managed_by_desktop: false,
+                    error: None,
+                },
+            );
+        }
+        DaemonProbeResult::OccupiedByOtherService { detail } => {
+            return set_status(
+                state,
+                DaemonStatus {
+                    running: false,
+                    managed_by_desktop: false,
+                    error: Some(format!(
+                        "Port {DAEMON_PORT} is already in use and did not pass KernLock authentication: {detail}"
+                    )),
+                },
+            );
+        }
+        DaemonProbeResult::NotListening => {}
     }
 
     // 2. Clean up any previously tracked exited child.
@@ -105,18 +182,33 @@ fn ensure_daemon_running(state: &DaemonState) -> DaemonStatus {
 
     let data_dir = default_data_dir();
     if let Err(e) = fs::create_dir_all(&data_dir) {
-        let status = DaemonStatus {
-            running: false,
-            managed_by_desktop: false,
-            error: Some(format!(
-                "Failed to create KernLock data directory {}: {}",
-                data_dir.display(),
-                e
-            )),
-        };
-        *state.status.lock().unwrap() = status.clone();
-        return status;
+        return set_status(
+            state,
+            DaemonStatus {
+                running: false,
+                managed_by_desktop: false,
+                error: Some(format!(
+                    "Failed to create KernLock data directory {}: {}",
+                    data_dir.display(),
+                    e
+                )),
+            },
+        );
     }
+
+    let bin_path = match locate_bundled_daemon() {
+        Ok(p) => p,
+        Err(e) => {
+            return set_status(
+                state,
+                DaemonStatus {
+                    running: false,
+                    managed_by_desktop: false,
+                    error: Some(e),
+                },
+            );
+        }
+    };
 
     let log_path = data_dir.join("daemon.log");
     let (stdout_cfg, stderr_cfg) = match OpenOptions::new().create(true).append(true).open(&log_path)
@@ -128,7 +220,6 @@ fn ensure_daemon_running(state: &DaemonState) -> DaemonStatus {
         Err(_) => (Stdio::null(), Stdio::null()),
     };
 
-    let bin_path = locate_daemon_binary();
     let mut cmd = Command::new(&bin_path);
     cmd.arg("--data-dir")
         .arg(&data_dir)
@@ -141,61 +232,68 @@ fn ensure_daemon_running(state: &DaemonState) -> DaemonStatus {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let status = DaemonStatus {
-                running: false,
-                managed_by_desktop: false,
-                error: Some(format!(
-                    "Failed to start KernLock daemon ({}): {}",
-                    bin_path.display(),
-                    e
-                )),
-            };
-            *state.status.lock().unwrap() = status.clone();
-            return status;
+            return set_status(
+                state,
+                DaemonStatus {
+                    running: false,
+                    managed_by_desktop: false,
+                    error: Some(format!(
+                        "Failed to start bundled KernLock daemon ({}): {}",
+                        bin_path.display(),
+                        e
+                    )),
+                },
+            );
         }
     };
 
-    // 3. Wait up to 5 seconds for health endpoint readiness.
+    // 3. Wait up to 5 seconds for authenticated readiness.
     for _ in 0..25 {
-        if probe_daemon_health(DAEMON_PORT) {
-            *state.child.lock().unwrap() = Some(child);
-            let status = DaemonStatus {
-                running: true,
-                managed_by_desktop: true,
-                error: None,
-            };
-            *state.status.lock().unwrap() = status.clone();
-            return status;
+        if let Ok(Some(tok)) = load_configured_token() {
+            if probe_authenticated_daemon(DAEMON_PORT, Some(&tok))
+                == DaemonProbeResult::AuthenticatedKernLock
+            {
+                *state.child.lock().unwrap() = Some(child);
+                return set_status(
+                    state,
+                    DaemonStatus {
+                        running: true,
+                        managed_by_desktop: true,
+                        error: None,
+                    },
+                );
+            }
         }
         if let Ok(Some(exit)) = child.try_wait() {
-            let status = DaemonStatus {
-                running: false,
-                managed_by_desktop: false,
-                error: Some(format!(
-                    "KernLock daemon exited prematurely with status {}. Check {}",
-                    exit,
-                    log_path.display()
-                )),
-            };
-            *state.status.lock().unwrap() = status.clone();
-            return status;
+            return set_status(
+                state,
+                DaemonStatus {
+                    running: false,
+                    managed_by_desktop: false,
+                    error: Some(format!(
+                        "KernLock daemon exited prematurely with status {}. Check {}",
+                        exit,
+                        log_path.display()
+                    )),
+                },
+            );
         }
         std::thread::sleep(Duration::from_millis(200));
     }
 
     let _ = child.kill();
     let _ = child.wait();
-    let status = DaemonStatus {
-        running: false,
-        managed_by_desktop: false,
-        error: Some(format!(
-            "Timed out waiting for KernLock daemon on 127.0.0.1:{}. Check {}",
-            DAEMON_PORT,
-            log_path.display()
-        )),
-    };
-    *state.status.lock().unwrap() = status.clone();
-    status
+    set_status(
+        state,
+        DaemonStatus {
+            running: false,
+            managed_by_desktop: false,
+            error: Some(format!(
+                "Timed out waiting for authenticated KernLock daemon on 127.0.0.1:{DAEMON_PORT}. Check {}",
+                log_path.display()
+            )),
+        },
+    )
 }
 
 fn shutdown_daemon(state: &DaemonState) {
@@ -207,27 +305,27 @@ fn shutdown_daemon(state: &DaemonState) {
 
 #[tauri::command]
 fn get_api_token() -> Result<String, String> {
-    if let Ok(env_token) = std::env::var("KERNLOCK_API_TOKEN") {
-        let trimmed = env_token.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
+    match load_configured_token()? {
+        Some(tok) => Ok(tok),
+        None => Err(format!(
+            "API token not found at {}",
+            auth_token_path(default_data_dir()).display()
+        )),
     }
-
-    let token_path = auth_token_path(default_data_dir());
-    read_validated_token_file(&token_path)
-        .map_err(|e| format!("Failed to load API token from {}: {}", token_path.display(), e))
 }
 
 #[tauri::command]
 fn get_daemon_status(state: tauri::State<'_, DaemonState>) -> DaemonStatus {
     let mut current = state.status.lock().unwrap().clone();
-    current.running = probe_daemon_health(DAEMON_PORT);
+    let token = load_configured_token().ok().flatten();
+    current.running =
+        probe_authenticated_daemon(DAEMON_PORT, token.as_deref()) == DaemonProbeResult::AuthenticatedKernLock;
     current
 }
 
 #[tauri::command]
 fn restart_daemon(state: tauri::State<'_, DaemonState>) -> DaemonStatus {
+    shutdown_daemon(&state);
     ensure_daemon_running(&state)
 }
 

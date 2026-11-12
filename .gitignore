@@ -12,6 +12,7 @@ dist-ssr/
 # Tauri
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/binaries/
 
 # SQLite & Local Runtime Data
 *.db

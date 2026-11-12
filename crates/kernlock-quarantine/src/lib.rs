@@ -38,6 +38,30 @@ impl std::fmt::Display for RollbackFailureInfo {
     }
 }
 
+#[derive(Debug)]
+pub struct CleanupFailureInfo {
+    pub operation: &'static str,
+    pub cause: String,
+    pub cleanup_error: String,
+    pub stranded_files: Vec<String>,
+    pub recovery_hint: String,
+}
+
+impl std::fmt::Display for CleanupFailureInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cleanup failed during '{}' (cause: {}; cleanup_error: {}); \
+             stranded files: [{}]. Hint: {}",
+            self.operation,
+            self.cause,
+            self.cleanup_error,
+            self.stranded_files.join(", "),
+            self.recovery_hint
+        )
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum QuarantineError {
     #[error("Storage error: {0}")]
@@ -60,6 +84,8 @@ pub enum QuarantineError {
     RolledBack { stage: &'static str, cause: String },
     #[error("{0}")]
     RollbackFailed(Box<RollbackFailureInfo>),
+    #[error("{0}")]
+    CleanupFailed(Box<CleanupFailureInfo>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +96,10 @@ pub enum FailureInjection {
     PermissionChangeAndRollbackMove,
     DatabaseWriteAndRollbackMove,
     DestinationRaceCreated,
+    DeleteMarkDeleting,
+    DeleteFinalizeDb,
+    DeleteFinalizeDbAndRollbackMove,
+    DeleteUnlinkCleanup,
 }
 
 #[derive(Clone)]
@@ -141,7 +171,8 @@ impl QuarantineManager {
         let id = Uuid::new_v4();
         let vault_path = self.vault_dir.join(format!("{}.locked", id));
 
-        move_file_no_clobber(&canonical_orig, &vault_path)?;
+        move_file_no_clobber(&canonical_orig, &vault_path)
+            .map_err(|e| e.into_quarantine_error())?;
 
         // Stage 2: Set restrictive 0600 permissions inside vault; roll back move on failure.
         let perm_res: Result<(), io::Error> = matches!(
@@ -158,12 +189,9 @@ impl QuarantineManager {
 
         if let Err(e) = perm_res {
             let rollback_move = if inject == FailureInjection::PermissionChangeAndRollbackMove {
-                Err(io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "injected rollback move failure",
-                ))
+                Err("injected rollback move failure".to_string())
             } else {
-                move_file_no_clobber(&vault_path, &canonical_orig)
+                move_file_no_clobber(&vault_path, &canonical_orig).map_err(|err| err.to_string())
             };
 
             if let Err(rb_err) = rollback_move {
@@ -171,7 +199,7 @@ impl QuarantineManager {
                     RollbackFailureInfo {
                         stage: "vault_chmod",
                         cause: e.to_string(),
-                        rollback_error: rb_err.to_string(),
+                        rollback_error: rb_err,
                         stranded_path: vault_path.display().to_string(),
                         original_path: canonical_orig.display().to_string(),
                         vault_path: vault_path.display().to_string(),
@@ -316,12 +344,12 @@ impl QuarantineManager {
 
         match move_file_no_clobber(&vault_path, &orig_path) {
             Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            Err(MoveError::Io(e)) if e.kind() == ErrorKind::AlreadyExists => {
                 return Err(QuarantineError::DestinationExists(
                     record.original_path.clone(),
                 ));
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e.into_quarantine_error()),
         }
 
         let perm_res: Result<(), io::Error> = matches!(
@@ -430,21 +458,184 @@ impl QuarantineManager {
     }
 
     pub fn delete_permanently(&self, id: Uuid) -> Result<(), QuarantineError> {
+        self.delete_permanently_with_injection(id, FailureInjection::None)
+    }
+
+    /// Database-safe permanent deletion using a recoverable `Deleting` state.
+    ///
+    /// 1. Transition DB status `Quarantined` -> `Deleting`.
+    /// 2. Move vault payload to staging path `.deleting_<id>.locked` (no-clobber).
+    /// 3. Transition DB status `Deleting` -> `Deleted`.
+    ///    - If step 3 fails, roll back staging file to `vault_path` and DB status to `Quarantined`.
+    /// 4. Remove staging file from disk; if unlink fails, return `CleanupFailed` with recovery info.
+    pub fn delete_permanently_with_injection(
+        &self,
+        id: Uuid,
+        inject: FailureInjection,
+    ) -> Result<(), QuarantineError> {
         let record = self.storage.get_quarantine(id)?;
-        if record.status != QuarantineStatus::Quarantined {
+        if record.status != QuarantineStatus::Quarantined
+            && record.status != QuarantineStatus::Deleting
+        {
             return Err(QuarantineError::InvalidState(id.to_string()));
         }
+
         let vault_path = PathBuf::from(&record.vault_path);
-        if vault_path.exists() {
-            fs::remove_file(&vault_path)?;
+        let deleting_path = self.vault_dir.join(format!(".deleting_{}.locked", id));
+
+        // Step 1: Mark record as `Deleting` before touching the payload on disk.
+        if record.status == QuarantineStatus::Quarantined {
+            if inject == FailureInjection::DeleteMarkDeleting {
+                return Err(QuarantineError::Storage(StorageError::NotFound(
+                    "injected delete mark-deleting DB failure".to_string(),
+                )));
+            }
+            self.storage
+                .update_quarantine_status(id, QuarantineStatus::Deleting, None)?;
         }
-        self.storage
-            .update_quarantine_status(id, QuarantineStatus::Deleted, None)?;
+
+        // Step 2: Stage the vault file to `.deleting_<id>.locked` so DB finalization failure is recoverable.
+        if fs::symlink_metadata(&vault_path).is_ok() {
+            if let Err(e) = move_file_no_clobber(&vault_path, &deleting_path) {
+                let rb_err =
+                    self.storage
+                        .update_quarantine_status(id, QuarantineStatus::Quarantined, None);
+                if let Err(db_rb) = rb_err {
+                    return Err(QuarantineError::RollbackFailed(Box::new(
+                        RollbackFailureInfo {
+                            stage: "delete_stage_move",
+                            cause: e.to_string(),
+                            rollback_error: db_rb.to_string(),
+                            stranded_path: vault_path.display().to_string(),
+                            original_path: record.original_path,
+                            vault_path: record.vault_path,
+                            sha256: record.sha256,
+                            original_mode: record.original_mode,
+                        },
+                    )));
+                }
+                return Err(e.into_quarantine_error());
+            }
+        }
+
+        // Step 3: Finalize DB status to `Deleted`.
+        let finalize_res = if matches!(
+            inject,
+            FailureInjection::DeleteFinalizeDb | FailureInjection::DeleteFinalizeDbAndRollbackMove
+        ) {
+            Err(StorageError::NotFound(
+                "injected delete finalize DB failure".to_string(),
+            ))
+        } else {
+            self.storage
+                .update_quarantine_status(id, QuarantineStatus::Deleted, None)
+        };
+
+        if let Err(e) = finalize_res {
+            let rollback_res: Result<(), String> = (|| {
+                if inject == FailureInjection::DeleteFinalizeDbAndRollbackMove {
+                    return Err("injected delete rollback move failure".to_string());
+                }
+                if fs::symlink_metadata(&deleting_path).is_ok() {
+                    move_file_no_clobber(&deleting_path, &vault_path)
+                        .map_err(|err| format!("move staging file back to vault failed: {err}"))?;
+                }
+                self.storage
+                    .update_quarantine_status(id, QuarantineStatus::Quarantined, None)
+                    .map_err(|err| format!("revert DB status to quarantined failed: {err}"))?;
+                Ok(())
+            })();
+
+            if let Err(rb_err) = rollback_res {
+                let stranded = if deleting_path.exists() {
+                    &deleting_path
+                } else {
+                    &vault_path
+                };
+                return Err(QuarantineError::RollbackFailed(Box::new(
+                    RollbackFailureInfo {
+                        stage: "delete_finalize_db",
+                        cause: e.to_string(),
+                        rollback_error: rb_err,
+                        stranded_path: stranded.display().to_string(),
+                        original_path: record.original_path,
+                        vault_path: record.vault_path,
+                        sha256: record.sha256,
+                        original_mode: record.original_mode,
+                    },
+                )));
+            }
+
+            return Err(QuarantineError::RolledBack {
+                stage: "delete_finalize_db",
+                cause: e.to_string(),
+            });
+        }
+
+        // Step 4: Remove staged file now that DB has committed `Deleted`.
+        if fs::symlink_metadata(&deleting_path).is_ok() {
+            let unlink_res = if inject == FailureInjection::DeleteUnlinkCleanup {
+                Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "injected delete unlink cleanup failure",
+                ))
+            } else {
+                fs::remove_file(&deleting_path)
+            };
+
+            if let Err(e) = unlink_res {
+                return Err(QuarantineError::CleanupFailed(Box::new(
+                    CleanupFailureInfo {
+                        operation: "delete_unlink_staging",
+                        cause: "DB marked record Deleted, but staging file removal failed"
+                            .to_string(),
+                        cleanup_error: e.to_string(),
+                        stranded_files: vec![deleting_path.display().to_string()],
+                        recovery_hint: format!(
+                            "Record {} is Deleted in DB; safely remove stranded staging file '{}'",
+                            id,
+                            deleting_path.display()
+                        ),
+                    },
+                )));
+            }
+        }
+
         Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<QuarantineRecord>, QuarantineError> {
         Ok(self.storage.list_quarantine()?)
+    }
+}
+
+#[derive(Debug)]
+pub enum MoveError {
+    Io(io::Error),
+    Cleanup(Box<CleanupFailureInfo>),
+}
+
+impl MoveError {
+    fn into_quarantine_error(self) -> QuarantineError {
+        match self {
+            MoveError::Io(e) => QuarantineError::Io(e),
+            MoveError::Cleanup(info) => QuarantineError::CleanupFailed(info),
+        }
+    }
+}
+
+impl std::fmt::Display for MoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MoveError::Io(e) => write!(f, "{e}"),
+            MoveError::Cleanup(info) => write!(f, "{info}"),
+        }
+    }
+}
+
+impl From<io::Error> for MoveError {
+    fn from(e: io::Error) -> Self {
+        MoveError::Io(e)
     }
 }
 
@@ -474,11 +665,7 @@ fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
 }
 
 /// Atomically move `src` to `dst` without ever overwriting an existing `dst`.
-///
-/// Uses kernel-level `RENAME_NOREPLACE` (Linux) / `RENAME_EXCL` (macOS) when
-/// supported, falls back to atomic `hard_link` + `remove_file` when needed,
-/// and performs a staged no-clobber copy with cleanup on cross-device moves (`EXDEV`).
-pub fn move_file_no_clobber(src: &Path, dst: &Path) -> io::Result<()> {
+pub fn move_file_no_clobber(src: &Path, dst: &Path) -> Result<(), MoveError> {
     #[cfg(target_os = "linux")]
     {
         use std::ffi::CString;
@@ -501,13 +688,13 @@ pub fn move_file_no_clobber(src: &Path, dst: &Path) -> io::Result<()> {
         }
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
-            Some(libc::EEXIST) => Err(io::Error::new(
+            Some(libc::EEXIST) => Err(MoveError::Io(io::Error::new(
                 ErrorKind::AlreadyExists,
                 format!("Destination already exists: {}", dst.display()),
-            )),
+            ))),
             Some(libc::EXDEV) => cross_fs_copy_no_clobber(src, dst, false),
-            Some(libc::ENOSYS) | Some(libc::EINVAL) => hard_link_or_cross_fs(src, dst),
-            _ => Err(err),
+            Some(libc::ENOSYS) | Some(libc::EINVAL) => hard_link_or_cross_fs(src, dst, false),
+            _ => Err(MoveError::Io(err)),
         }
     }
 
@@ -525,33 +712,53 @@ pub fn move_file_no_clobber(src: &Path, dst: &Path) -> io::Result<()> {
         }
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
-            Some(libc::EEXIST) => Err(io::Error::new(
+            Some(libc::EEXIST) => Err(MoveError::Io(io::Error::new(
                 ErrorKind::AlreadyExists,
                 format!("Destination already exists: {}", dst.display()),
-            )),
+            ))),
             Some(libc::EXDEV) => cross_fs_copy_no_clobber(src, dst, false),
-            Some(libc::ENOTSUP) => hard_link_or_cross_fs(src, dst),
-            _ => Err(err),
+            Some(libc::ENOTSUP) => hard_link_or_cross_fs(src, dst, false),
+            _ => Err(MoveError::Io(err)),
         }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        hard_link_or_cross_fs(src, dst)
+        hard_link_or_cross_fs(src, dst, false)
     }
 }
 
-fn hard_link_or_cross_fs(src: &Path, dst: &Path) -> io::Result<()> {
+pub fn hard_link_or_cross_fs(
+    src: &Path,
+    dst: &Path,
+    inject_unlink_failure: bool,
+) -> Result<(), MoveError> {
     match fs::hard_link(src, dst) {
         Ok(()) => {
-            if let Err(e) = fs::remove_file(src) {
-                let _ = fs::remove_file(dst);
-                return Err(e);
+            let remove_res = if inject_unlink_failure {
+                Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "injected hard-link source removal failure",
+                ))
+            } else {
+                fs::remove_file(src)
+            };
+            if let Err(e) = remove_res {
+                if let Err(cleanup_err) = fs::remove_file(dst) {
+                    return Err(MoveError::Cleanup(Box::new(CleanupFailureInfo {
+                        operation: "hard_link_move",
+                        cause: e.to_string(),
+                        cleanup_error: cleanup_err.to_string(),
+                        stranded_files: vec![src.display().to_string(), dst.display().to_string()],
+                        recovery_hint: "Both source and destination links remain; remove the unintended duplicate link after verifying integrity.".to_string(),
+                    })));
+                }
+                return Err(MoveError::Io(e));
             }
             Ok(())
         }
         Err(e) if is_cross_device_error(&e) => cross_fs_copy_no_clobber(src, dst, false),
-        Err(e) => Err(e),
+        Err(e) => Err(MoveError::Io(e)),
     }
 }
 
@@ -570,17 +777,17 @@ fn is_cross_device_error(err: &io::Error) -> bool {
 
 /// Perform a staged cross-filesystem copy to `dst` without overwriting an existing `dst`.
 ///
-/// Always cleans up the temporary staging file on any error (including injected copy failure).
+/// Surfaces any staging or rollback cleanup failure via `MoveError::Cleanup`.
 pub fn cross_fs_copy_no_clobber(
     src: &Path,
     dst: &Path,
     inject_copy_failure: bool,
-) -> io::Result<()> {
+) -> Result<(), MoveError> {
     let parent = dst.parent().ok_or_else(|| {
-        io::Error::new(
+        MoveError::Io(io::Error::new(
             ErrorKind::InvalidInput,
             format!("Destination has no parent directory: {}", dst.display()),
-        )
+        ))
     })?;
     let tmp_path = parent.join(format!(".kernlock_staging_{}", Uuid::new_v4()));
 
@@ -618,20 +825,60 @@ pub fn cross_fs_copy_no_clobber(
     })();
 
     if let Err(e) = copy_res {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
+        if tmp_path.exists() {
+            if let Err(cleanup_err) = fs::remove_file(&tmp_path) {
+                return Err(MoveError::Cleanup(Box::new(CleanupFailureInfo {
+                    operation: "cross_fs_copy",
+                    cause: e.to_string(),
+                    cleanup_error: cleanup_err.to_string(),
+                    stranded_files: vec![tmp_path.display().to_string()],
+                    recovery_hint:
+                        "Remove partial staging file after verifying source remains intact."
+                            .to_string(),
+                })));
+            }
+        }
+        return Err(MoveError::Io(e));
     }
 
     // Atomically publish staging file to `dst` without clobbering any existing file.
     if let Err(e) = fs::hard_link(&tmp_path, dst) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
+        if let Err(cleanup_err) = fs::remove_file(&tmp_path) {
+            return Err(MoveError::Cleanup(Box::new(CleanupFailureInfo {
+                operation: "cross_fs_publish",
+                cause: e.to_string(),
+                cleanup_error: cleanup_err.to_string(),
+                stranded_files: vec![tmp_path.display().to_string()],
+                recovery_hint: "Remove staging file; destination was not modified.".to_string(),
+            })));
+        }
+        return Err(MoveError::Io(e));
     }
-    let _ = fs::remove_file(&tmp_path);
+
+    if let Err(cleanup_err) = fs::remove_file(&tmp_path) {
+        return Err(MoveError::Cleanup(Box::new(CleanupFailureInfo {
+            operation: "cross_fs_staging_unlink",
+            cause: "Published destination successfully, but failed to remove staging file"
+                .to_string(),
+            cleanup_error: cleanup_err.to_string(),
+            stranded_files: vec![tmp_path.display().to_string(), src.display().to_string()],
+            recovery_hint:
+                "Remove temporary staging file and verify whether source file should be removed."
+                    .to_string(),
+        })));
+    }
 
     if let Err(e) = fs::remove_file(src) {
-        let _ = fs::remove_file(dst);
-        return Err(e);
+        if let Err(cleanup_err) = fs::remove_file(dst) {
+            return Err(MoveError::Cleanup(Box::new(CleanupFailureInfo {
+                operation: "cross_fs_source_unlink",
+                cause: e.to_string(),
+                cleanup_error: cleanup_err.to_string(),
+                stranded_files: vec![src.display().to_string(), dst.display().to_string()],
+                recovery_hint: "Both source and destination files exist; remove the duplicate after verifying SHA-256.".to_string(),
+            })));
+        }
+        return Err(MoveError::Io(e));
     }
 
     Ok(())

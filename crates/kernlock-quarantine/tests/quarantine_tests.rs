@@ -309,7 +309,112 @@ fn cross_fs_copy_cleans_up_partial_staging_and_never_clobbers() {
     // 2. Existing destination must never be overwritten
     fs::write(&dst, b"do not overwrite").unwrap();
     let err = kernlock_quarantine::cross_fs_copy_no_clobber(&src, &dst, false).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    match err {
+        kernlock_quarantine::MoveError::Io(io_err) => {
+            assert_eq!(io_err.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+        other => panic!("Expected MoveError::Io(AlreadyExists), got {other:?}"),
+    }
     assert_eq!(fs::read(&dst).unwrap(), b"do not overwrite");
     assert!(src.exists());
+}
+
+#[test]
+fn hard_link_move_cleans_up_destination_on_source_unlink_failure() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("hl_src.bin");
+    let dst = tmp.path().join("hl_dst.bin");
+    fs::write(&src, b"hardlink bytes").unwrap();
+
+    let err = kernlock_quarantine::hard_link_or_cross_fs(&src, &dst, true).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("injected hard-link source removal failure"));
+    assert!(src.exists(), "Source must remain intact");
+    assert!(
+        !dst.exists(),
+        "Destination hard-link must be cleaned up when source removal fails"
+    );
+}
+
+#[test]
+fn delete_permanently_uses_recoverable_deleting_state_and_rolls_back() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let qm = QuarantineManager::new(tmp.path().join("vault"), storage.clone()).unwrap();
+
+    let target = tmp.path().join("to_delete.bin");
+    fs::write(&target, b"malware fixture bytes").unwrap();
+    let rec = qm.quarantine_file(&target, "test delete").unwrap();
+    let vault_file = std::path::PathBuf::from(&rec.vault_path);
+
+    // 1. Failure marking Deleting leaves file & DB Quarantined
+    let err = qm
+        .delete_permanently_with_injection(rec.id, FailureInjection::DeleteMarkDeleting)
+        .unwrap_err();
+    assert!(matches!(err, QuarantineError::Storage(_)));
+    assert!(vault_file.exists());
+    assert_eq!(
+        storage.get_quarantine(rec.id).unwrap().status,
+        QuarantineStatus::Quarantined
+    );
+
+    // 2. Failure finalizing Deleted in DB rolls back staging file & DB status to Quarantined
+    let err = qm
+        .delete_permanently_with_injection(rec.id, FailureInjection::DeleteFinalizeDb)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        QuarantineError::RolledBack {
+            stage: "delete_finalize_db",
+            ..
+        }
+    ));
+    assert!(vault_file.exists());
+    assert_eq!(
+        storage.get_quarantine(rec.id).unwrap().status,
+        QuarantineStatus::Quarantined
+    );
+
+    // 3. Rollback failure during delete finalization returns RollbackFailed with recovery info
+    let err = qm
+        .delete_permanently_with_injection(
+            rec.id,
+            FailureInjection::DeleteFinalizeDbAndRollbackMove,
+        )
+        .unwrap_err();
+    match err {
+        QuarantineError::RollbackFailed(info) => {
+            assert_eq!(info.stage, "delete_finalize_db");
+            assert!(std::path::Path::new(&info.stranded_path).exists());
+        }
+        other => panic!("Expected RollbackFailed, got {other:?}"),
+    }
+    // Record is in Deleting state with staged file on disk — verify delete_permanently recovers & completes
+    assert_eq!(
+        storage.get_quarantine(rec.id).unwrap().status,
+        QuarantineStatus::Deleting
+    );
+    qm.delete_permanently(rec.id).unwrap();
+    assert_eq!(
+        storage.get_quarantine(rec.id).unwrap().status,
+        QuarantineStatus::Deleted
+    );
+    assert!(!vault_file.exists());
+
+    // 4. Unlink cleanup failure after DB Deleted returns CleanupFailed with stranded file path
+    let target2 = tmp.path().join("to_delete_2.bin");
+    fs::write(&target2, b"second fixture").unwrap();
+    let rec2 = qm.quarantine_file(&target2, "test delete 2").unwrap();
+    let err = qm
+        .delete_permanently_with_injection(rec2.id, FailureInjection::DeleteUnlinkCleanup)
+        .unwrap_err();
+    match err {
+        QuarantineError::CleanupFailed(info) => {
+            assert_eq!(info.operation, "delete_unlink_staging");
+            assert_eq!(info.stranded_files.len(), 1);
+            assert!(std::path::Path::new(&info.stranded_files[0]).exists());
+        }
+        other => panic!("Expected CleanupFailed, got {other:?}"),
+    }
 }

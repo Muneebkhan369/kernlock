@@ -1,6 +1,8 @@
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Resolve the KernLock data directory for a specific OS and environment inputs.
 ///
@@ -70,6 +72,24 @@ pub fn default_data_dir() -> PathBuf {
     )
 }
 
+/// Validate a custom `KERNLOCK_API_TOKEN` environment variable value.
+///
+/// Returns `Ok(Some(token))` if set and valid (`>= 32` chars), `Ok(None)` if empty/unset,
+/// or `Err` if non-empty but shorter than 32 characters.
+pub fn validate_env_token(raw: &str) -> io::Result<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() < 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "KERNLOCK_API_TOKEN must be at least 32 characters",
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 /// Resolve the canonical `auth.token` path inside a data directory.
 pub fn auth_token_path<P: AsRef<Path>>(data_dir: P) -> PathBuf {
     data_dir.as_ref().join("auth.token")
@@ -133,4 +153,58 @@ pub fn read_validated_token_file<P: AsRef<Path>>(token_path: P) -> io::Result<St
         ));
     }
     Ok(trimmed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonProbeResult {
+    NotListening,
+    AuthenticatedKernLock,
+    OccupiedByOtherService { detail: String },
+}
+
+/// Probe `127.0.0.1:<port>` using an authenticated `GET /api/status` request.
+///
+/// Never trusts unauthenticated `/api/health` to identify an existing KernLock daemon.
+pub fn probe_authenticated_daemon(port: u16, token: Option<&str>) -> DaemonProbeResult {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
+        Ok(s) => s,
+        Err(_) => return DaemonProbeResult::NotListening,
+    };
+
+    let Some(tok) = token.map(str::trim).filter(|t| t.len() >= 32) else {
+        return DaemonProbeResult::OccupiedByOtherService {
+            detail: format!(
+                "127.0.0.1:{port} is already accepting connections, but no valid local auth.token is available to verify it"
+            ),
+        };
+    };
+
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
+    let req = format!(
+        "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {tok}\r\nConnection: close\r\n\r\n"
+    );
+    if let Err(e) = stream.write_all(req.as_bytes()) {
+        return DaemonProbeResult::OccupiedByOtherService {
+            detail: format!("Failed to query 127.0.0.1:{port}: {e}"),
+        };
+    }
+
+    let mut buf = Vec::new();
+    let _ = stream.take(16 * 1024).read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    let first_line = text.lines().next().unwrap_or("");
+    if first_line.contains("200")
+        && text.contains("\"capabilities\"")
+        && text.contains("\"policy\"")
+    {
+        DaemonProbeResult::AuthenticatedKernLock
+    } else {
+        DaemonProbeResult::OccupiedByOtherService {
+            detail: format!(
+                "127.0.0.1:{port} is occupied by an unrelated or unauthenticated service (status line: '{first_line}')"
+            ),
+        }
+    }
 }

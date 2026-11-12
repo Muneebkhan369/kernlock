@@ -218,3 +218,52 @@ fn auth_token_is_created_with_0600_and_rejects_symlinks_or_permissive_modes() {
     symlink(&other, &token_path).unwrap();
     assert!(kernlock_daemon::auth::load_or_create_token(tmp.path()).is_err());
 }
+
+#[tokio::test]
+async fn probe_rejects_unrelated_service_even_if_spoofing_health() {
+    use kernlock_core::paths::{probe_authenticated_daemon, DaemonProbeResult};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // 1. Bind an unrelated listener that spoofs /api/health
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let req = String::from_utf8_lossy(&buf);
+            let resp = if req.starts_with("GET /api/health") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 37\r\n\r\n{\"service\":\"kernlockd\",\"status\":\"ok\"}"
+            } else {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found"
+            };
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let token = "0123456789abcdef0123456789abcdef";
+    let res = probe_authenticated_daemon(port, Some(token));
+    assert!(
+        matches!(res, DaemonProbeResult::OccupiedByOtherService { .. }),
+        "Spoofed/unrelated service must be reported as OccupiedByOtherService, got {res:?}"
+    );
+    let _ = handle.join();
+
+    // 2. Real kernlockd router on an ephemeral port must return AuthenticatedKernLock
+    let tmp = TempDir::new().unwrap();
+    let engine = KernLockEngine::init(tmp.path()).unwrap();
+    let app = kernlock_daemon::api::build_router(engine, token.to_string(), None);
+    let tokio_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let real_port = tokio_listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(tokio_listener, app).await;
+    });
+
+    let real_res =
+        tokio::task::spawn_blocking(move || probe_authenticated_daemon(real_port, Some(token)))
+            .await
+            .unwrap();
+    assert_eq!(real_res, DaemonProbeResult::AuthenticatedKernLock);
+    server.abort();
+}

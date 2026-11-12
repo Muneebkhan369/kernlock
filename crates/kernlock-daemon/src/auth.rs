@@ -1,5 +1,5 @@
 use anyhow::Result;
-use kernlock_core::paths::{auth_token_path, read_validated_token_file};
+use kernlock_core::paths::{auth_token_path, read_validated_token_file, validate_env_token};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::Path;
@@ -11,9 +11,8 @@ pub fn generate_token() -> String {
 
 pub fn load_or_create_token<P: AsRef<Path>>(data_dir: P) -> Result<String> {
     if let Ok(env_token) = std::env::var("KERNLOCK_API_TOKEN") {
-        let trimmed = env_token.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+        if let Some(valid) = validate_env_token(&env_token)? {
+            return Ok(valid);
         }
     }
 
@@ -32,8 +31,6 @@ pub fn load_or_create_token<P: AsRef<Path>>(data_dir: P) -> Result<String> {
     }
 
     let token = generate_token();
-    let tmp_path = dir.join(format!(".auth.token.tmp.{}", Uuid::new_v4()));
-
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -42,41 +39,22 @@ pub fn load_or_create_token<P: AsRef<Path>>(data_dir: P) -> Result<String> {
         opts.mode(0o600);
     }
 
-    let write_res = (|| -> std::io::Result<()> {
-        let mut file = opts.open(&tmp_path)?;
-        file.write_all(token.as_bytes())?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_res {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-
-    match fs::hard_link(&tmp_path, &token_path) {
-        Ok(()) => {
-            let _ = fs::remove_file(&tmp_path);
+    match opts.open(&token_path) {
+        Ok(mut file) => {
+            if let Err(e) = (|| -> std::io::Result<()> {
+                file.write_all(token.as_bytes())?;
+                file.sync_all()?;
+                Ok(())
+            })() {
+                let _ = fs::remove_file(&token_path);
+                return Err(e.into());
+            }
             Ok(read_validated_token_file(&token_path)?)
         }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(&tmp_path);
             Ok(read_validated_token_file(&token_path)?)
         }
-        Err(e) => {
-            // Fallback for filesystems where hard links are unsupported: rename if not already present.
-            if fs::symlink_metadata(&token_path).is_ok() {
-                let _ = fs::remove_file(&tmp_path);
-                return Ok(read_validated_token_file(&token_path)?);
-            }
-            if let Err(rename_err) = fs::rename(&tmp_path, &token_path) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(anyhow::anyhow!(
-                    "Failed to publish token file ({e}; rename fallback: {rename_err})"
-                ));
-            }
-            Ok(read_validated_token_file(&token_path)?)
-        }
+        Err(e) => Err(e.into()),
     }
 }
 

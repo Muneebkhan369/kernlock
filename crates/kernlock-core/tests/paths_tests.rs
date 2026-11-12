@@ -1,4 +1,6 @@
-use kernlock_core::paths::{auth_token_path, read_validated_token_file, resolve_data_dir_for_os};
+use kernlock_core::paths::{
+    auth_token_path, read_validated_token_file, resolve_data_dir_for_os, validate_env_token,
+};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::tempdir;
@@ -42,6 +44,14 @@ fn resolves_platform_data_dirs_consistently() {
         auth_token_path(&linux_default),
         PathBuf::from("/home/alice/.local/share/kernlock/auth.token")
     );
+}
+
+#[test]
+fn validates_custom_env_token_length() {
+    assert_eq!(validate_env_token("   ").unwrap(), None);
+    assert!(validate_env_token("short-token").is_err());
+    let valid = "0123456789abcdef0123456789abcdef";
+    assert_eq!(validate_env_token(valid).unwrap().as_deref(), Some(valid));
 }
 
 #[cfg(unix)]

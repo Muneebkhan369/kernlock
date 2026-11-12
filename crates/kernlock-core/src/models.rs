@@ -210,6 +210,7 @@ pub struct QuarantineRecord {
 pub enum QuarantineStatus {
     Quarantined,
     Restored,
+    Deleting,
     Deleted,
 }
 
