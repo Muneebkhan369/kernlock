@@ -2,4 +2,9 @@
   <PropertyGroup>
     <SignMode Condition="'$(SignMode)' == ''">Off</SignMode>
   </PropertyGroup>
+
+  <!-- Conditional Windows SDK C++ Targets -->
+  <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\native\Microsoft.Windows.SDK.cpp.targets" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\native\Microsoft.Windows.SDK.cpp.targets')" />
+  <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.3323\build\native\Microsoft.Windows.SDK.cpp.targets" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.3323\build\native\Microsoft.Windows.SDK.cpp.targets')" />
+  <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.targets" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.targets')" />
 </Project>

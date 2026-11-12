@@ -16,4 +16,9 @@
   <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.x64.10.0.26100.6584\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.x64.10.0.26100.6584\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'" />
   <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.x64.10.0.26100.3323\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.x64.10.0.26100.3323\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'" />
   <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.x64.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.x64.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'" />
+
+  <!-- Conditional Windows SDK C++ Common Props -->
+  <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\native\Microsoft.Windows.SDK.cpp.props')" />
+  <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.3323\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.3323\build\native\Microsoft.Windows.SDK.cpp.props')" />
+  <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.props')" />
 </Project>
