@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FanotifyMonitorHealth {
@@ -21,9 +22,8 @@ use {
     },
     std::fs,
     std::path::PathBuf,
-    std::sync::RwLock,
     std::thread,
-    tracing::{error, info, warn},
+    tracing::{error, warn},
     uuid::Uuid,
 };
 

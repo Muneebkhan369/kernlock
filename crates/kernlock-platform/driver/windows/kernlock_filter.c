@@ -155,6 +155,20 @@ KernLockPreCreate (
     requestMsg.Header.ThreadId = (unsigned long)(ULONG_PTR)PsGetCurrentThreadId();
     requestMsg.DesiredAccess = desiredAccess;
 
+    // Secure File ID extraction to eliminate user-mode TOCTOU path races
+    if (FltObjects->FileObject != NULL && FltObjects->Instance != NULL) {
+        FILE_INTERNAL_INFORMATION internalInfo;
+        RtlZeroMemory(&internalInfo, sizeof(FILE_INTERNAL_INFORMATION));
+        if (NT_SUCCESS(FltQueryInformationFile(FltObjects->Instance,
+                                               FltObjects->FileObject,
+                                               &internalInfo,
+                                               sizeof(FILE_INTERNAL_INFORMATION),
+                                               FileInternalInformation,
+                                               NULL))) {
+            requestMsg.FileId = (unsigned __int64)internalInfo.IndexNumber.QuadPart;
+        }
+    }
+
     if (nameInfo->Name.Length < sizeof(requestMsg.FilePath)) {
         RtlCopyMemory(requestMsg.FilePath, nameInfo->Name.Buffer, nameInfo->Name.Length);
     }
@@ -244,6 +258,20 @@ KernLockPreAcquireForSectionSynchronization (
     requestMsg.Header.ProcessId = (unsigned long)(ULONG_PTR)PsGetCurrentProcessId();
     requestMsg.Header.ThreadId = (unsigned long)(ULONG_PTR)PsGetCurrentThreadId();
     requestMsg.DesiredAccess = pageProtection;
+
+    // Secure File ID extraction for section synchronization
+    if (FltObjects->FileObject != NULL && FltObjects->Instance != NULL) {
+        FILE_INTERNAL_INFORMATION internalInfo;
+        RtlZeroMemory(&internalInfo, sizeof(FILE_INTERNAL_INFORMATION));
+        if (NT_SUCCESS(FltQueryInformationFile(FltObjects->Instance,
+                                               FltObjects->FileObject,
+                                               &internalInfo,
+                                               sizeof(FILE_INTERNAL_INFORMATION),
+                                               FileInternalInformation,
+                                               NULL))) {
+            requestMsg.FileId = (unsigned __int64)internalInfo.IndexNumber.QuadPart;
+        }
+    }
 
     if (nameInfo->Name.Length < sizeof(requestMsg.FilePath)) {
         RtlCopyMemory(requestMsg.FilePath, nameInfo->Name.Buffer, nameInfo->Name.Length);

@@ -1,0 +1,5 @@
+<Project>
+  <PropertyGroup>
+    <SignMode Condition="'$(SignMode)' == ''">Off</SignMode>
+  </PropertyGroup>
+</Project>

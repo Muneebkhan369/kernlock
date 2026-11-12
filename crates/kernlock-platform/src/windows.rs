@@ -70,6 +70,7 @@ pub struct RawExecutionRequestMsg {
     pub header: RawMinifilterMsgHeader,
     pub desired_access: u32,
     pub parent_process_id: u32,
+    pub file_id: u64,
     pub file_path: [u16; 1024],
 }
 
@@ -208,6 +209,7 @@ mod flt_ffi {
 
     #[link(name = "kernel32")]
     extern "system" {
+        #[allow(dead_code)]
         pub fn CloseHandle(hObject: HANDLE) -> i32;
     }
 }
@@ -237,8 +239,7 @@ impl MinifilterClient {
             }
 
             // Attempt a temporary non-blocking probe connection
-            let mut port_name_wide: Vec<u16> =
-                FILTER_PORT_NAME.encode_utf16().chain(Some(0)).collect();
+            let port_name_wide: Vec<u16> = FILTER_PORT_NAME.encode_utf16().chain(Some(0)).collect();
             let mut h_port: flt_ffi::HANDLE = std::ptr::null_mut();
 
             let hr = unsafe {
@@ -309,14 +310,14 @@ impl MinifilterClient {
         }
 
         // Perform bounded streaming file content inspection if accessible
-        // Perform bounded streaming file content inspection if accessible
         let scan_outcome = (|| -> Result<kernlock_core::models::FileScanResult, String> {
             #[cfg(target_os = "windows")]
             let mut file = {
                 use std::os::windows::fs::OpenOptionsExt;
+                // Never pass FILE_SHARE_DELETE: lock out concurrent file replacement during scan
                 fs::OpenOptions::new()
                     .read(true)
-                    .share_mode(7) // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                    .share_mode(3) // FILE_SHARE_READ | FILE_SHARE_WRITE
                     .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS
                     .open(&path)
                     .map_err(|e| format!("Failed to open file: {}", e))?
@@ -330,6 +331,50 @@ impl MinifilterClient {
                 .map_err(|e| format!("Failed to read metadata: {}", e))?;
             if !meta.is_file() {
                 return Err("Target is not a regular file".to_string());
+            }
+
+            // Secure File ID verification to eliminate TOCTOU path races
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::io::AsRawHandle;
+                #[repr(C)]
+                struct BY_HANDLE_FILE_INFORMATION {
+                    dw_file_attributes: u32,
+                    ft_creation_time: [u32; 2],
+                    ft_last_access_time: [u32; 2],
+                    ft_last_write_time: [u32; 2],
+                    dw_volume_serial_number: u32,
+                    n_file_size_high: u32,
+                    n_file_size_low: u32,
+                    n_number_of_links: u32,
+                    n_file_index_high: u32,
+                    n_file_index_low: u32,
+                }
+                extern "system" {
+                    fn GetFileInformationByHandle(
+                        h_file: *mut std::ffi::c_void,
+                        lp_file_information: *mut BY_HANDLE_FILE_INFORMATION,
+                    ) -> i32;
+                }
+
+                let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+                let ok = unsafe {
+                    GetFileInformationByHandle(
+                        file.as_raw_handle() as *mut std::ffi::c_void,
+                        &mut info,
+                    )
+                };
+                if ok != 0 {
+                    let opened_file_id =
+                        ((info.n_file_index_high as u64) << 32) | (info.n_file_index_low as u64);
+                    let req_file_id = request.file_id;
+                    if req_file_id != 0 && opened_file_id != req_file_id {
+                        return Err(format!(
+                            "TOCTOU race detected: opened file ID {} does not match kernel file ID {}",
+                            opened_file_id, req_file_id
+                        ));
+                    }
+                }
             }
 
             kernlock_core::analyzer::scan_stream_reader(&mut file, &file_path_str, rules, policy)
@@ -519,10 +564,11 @@ impl MinifilterClient {
                         }
 
                         // Validate message ID integrity
-                        if msg.data.header.message_id != msg.message_id {
+                        let header_msg_id = msg.data.header.message_id;
+                        if header_msg_id != msg.message_id {
                             tracing::warn!(
                                 "Packet ID mismatch: header {} != message {}",
-                                msg.data.header.message_id,
+                                header_msg_id,
                                 msg.message_id
                             );
                         }

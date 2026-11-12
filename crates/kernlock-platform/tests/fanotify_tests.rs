@@ -229,8 +229,14 @@ fn test_privileged_linux_fanotify_execution_blocking() {
 
         let probe = FanotifyPermissionMonitor::probe_support();
         if !probe.exec_blocking_available {
+            if std::env::var("KERNLOCK_REQUIRE_PRIVILEGED").is_ok() {
+                panic!(
+                    "MANDATORY PRIVILEGED TEST FAILED: CAP_SYS_ADMIN/root required but unavailable: {}",
+                    probe.details
+                );
+            }
             println!(
-                "SKIPPING privileged fanotify test: root / CAP_SYS_ADMIN required ({})",
+                "[SKIPPED] privileged fanotify test: root / CAP_SYS_ADMIN required ({})",
                 probe.details
             );
             return;
@@ -313,6 +319,9 @@ fn test_privileged_linux_fanotify_execution_blocking() {
         assert_eq!(
             FanotifyPermissionMonitor::global_health().0,
             FanotifyMonitorHealth::Stopped
+        );
+        println!(
+            "[PASSED] privileged fanotify test: real execution blocking and clean execution verified"
         );
     }
 }

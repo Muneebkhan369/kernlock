@@ -127,6 +127,7 @@ fn test_raw_c_matching_minifilter_request_verdict_evaluation() {
         },
         desired_access: 0x0000_0020, // FILE_EXECUTE
         parent_process_id: 4,
+        file_id: 0,
         file_path: file_path_utf16,
     };
 
@@ -166,6 +167,7 @@ fn test_raw_c_matching_minifilter_request_verdict_evaluation() {
         },
         desired_access: 0x0000_0020,
         parent_process_id: 4,
+        file_id: 0,
         file_path: missing_path_utf16,
     };
 

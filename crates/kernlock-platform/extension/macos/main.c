@@ -112,20 +112,38 @@ static int query_daemon_verdict(const char *path, pid_t pid, pid_t ppid, int is_
              "{\"action\":\"eval_es\",\"path\":\"%s\",\"pid\":%d,\"ppid\":%d,\"is_exec\":%s}\n",
              escaped_path, pid, ppid, is_exec ? "true" : "false");
 
-    if (write(sock, request_json, strlen(request_json)) <= 0) {
-        close(sock);
-        return -1;
+    // Write full request with retry
+    size_t total_written = 0;
+    size_t req_len = strlen(request_json);
+    while (total_written < req_len) {
+        ssize_t w = write(sock, request_json + total_written, req_len - total_written);
+        if (w <= 0) {
+            close(sock);
+            return -1;
+        }
+        total_written += (size_t)w;
     }
 
+    // Read full response up to newline or EOF
     char response_buf[512];
-    ssize_t bytes_read = read(sock, response_buf, sizeof(response_buf) - 1);
+    size_t total_read = 0;
+    while (total_read < sizeof(response_buf) - 1) {
+        ssize_t r = read(sock, response_buf + total_read, sizeof(response_buf) - 1 - total_read);
+        if (r <= 0) {
+            break;
+        }
+        total_read += (size_t)r;
+        if (memchr(response_buf, '\n', total_read) != NULL) {
+            break;
+        }
+    }
     close(sock);
 
-    if (bytes_read <= 0) {
+    if (total_read == 0) {
         return -1;
     }
 
-    response_buf[bytes_read] = '\0';
+    response_buf[total_read] = '\0';
 
     // Synchronize current mode with daemon response
     if (strstr(response_buf, "\"mode\":\"strict\"") != NULL) {
@@ -136,12 +154,20 @@ static int query_daemon_verdict(const char *path, pid_t pid, pid_t ppid, int is_
         g_current_mode = MODE_AUDIT;
     }
 
-    if (strstr(response_buf, "\"verdict\":\"block\"") != NULL ||
-        strstr(response_buf, "\"verdict\":\"deny\"") != NULL) {
-        return 1;
-    }
+    // Validate response payload: never treat malformed or unknown responses as clean
+    int has_block = (strstr(response_buf, "\"verdict\":\"block\"") != NULL ||
+                     strstr(response_buf, "\"verdict\":\"deny\"") != NULL);
+    int has_allow = (strstr(response_buf, "\"verdict\":\"allow\"") != NULL);
 
-    return 0;
+    if (has_block) {
+        return 1;
+    } else if (has_allow) {
+        return 0;
+    } else {
+        // Unknown, truncated or malformed response: treat as communication error
+        fprintf(stderr, "[KernLock ES] Malformed or unrecognized daemon response: %s\n", response_buf);
+        return -1;
+    }
 }
 
 /**
@@ -258,8 +284,12 @@ static void handle_auth_open(es_client_t *client, const es_message_t *message) {
     if (verdict == 1) {
         printf("[KernLock ES] BLOCKED file open: %s (PID: %d)\n", file_path, pid);
         es_respond_auth_result(client, message, ES_AUTH_RESULT_DENY, false);
+    } else if (verdict == 0) {
+        es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, true);
     } else {
-        es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, verdict == 0);
+        // Daemon unreachable or malformed response -> policy fallback
+        es_auth_result_t fallback = (g_current_mode == MODE_STRICT) ? ES_AUTH_RESULT_DENY : ES_AUTH_RESULT_ALLOW;
+        es_respond_auth_result(client, message, fallback, false);
     }
 }
 

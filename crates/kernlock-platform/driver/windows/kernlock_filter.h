@@ -28,6 +28,7 @@ typedef struct _EXECUTION_REQUEST_MSG {
     MINIFILTER_MSG_HEADER Header;
     unsigned long         DesiredAccess;
     unsigned long         ParentProcessId;
+    unsigned __int64      FileId;
     wchar_t               FilePath[1024];
 } EXECUTION_REQUEST_MSG, *PEXECUTION_REQUEST_MSG;
 

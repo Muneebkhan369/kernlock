@@ -52,6 +52,24 @@ jobs:
           ./scripts/package-deb.sh
           ls -lh target/debian/*.deb
 
+  linux-privileged-acceptance:
+    name: Linux Privileged Fanotify Acceptance Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run privileged fanotify acceptance test with root privileges
+        run: |
+          chmod +x scripts/test-privileged-linux.sh
+          sudo -E env "PATH=$PATH" "CARGO_HOME=$HOME/.cargo" ./scripts/test-privileged-linux.sh
+
   windows-build-and-test:
     name: Windows Test & Minifilter Driver Build
     runs-on: windows-latest
@@ -68,15 +86,35 @@ jobs:
       - name: Run Windows platform and core tests
         run: cargo test -p kernlock-core -p kernlock-storage -p kernlock-quarantine -p kernlock-platform --test windows_tests
 
+      - name: Setup NuGet
+        uses: nuget/setup-nuget@v2
+
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Inspect Minifilter Driver project syntax
+      - name: Restore WDK and SDK NuGet packages
         shell: pwsh
         run: |
-          Test-Path crates/kernlock-platform/driver/windows/kernlock_filter.vcxproj
-          Test-Path crates/kernlock-platform/driver/windows/kernlock_filter.c
-          Test-Path crates/kernlock-platform/driver/windows/kernlock_filter.h
+          nuget restore crates/kernlock-platform/driver/windows/packages.config -PackagesDirectory crates/kernlock-platform/driver/windows/packages
+
+      - name: Build Minifilter Driver (kernlock_filter.sys)
+        shell: pwsh
+        run: |
+          msbuild crates/kernlock-platform/driver/windows/kernlock_filter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=Off
+
+      - name: Verify Minifilter Driver binary exists
+        shell: pwsh
+        run: |
+          $driverFiles = Get-ChildItem -Path crates/kernlock-platform/driver/windows -Recurse -Filter kernlock_filter.sys
+          if ($driverFiles.Count -eq 0) {
+            $driverFiles = Get-ChildItem -Path . -Recurse -Filter kernlock_filter.sys
+          }
+          if ($driverFiles.Count -eq 0) {
+            Write-Error "kernlock_filter.sys was not produced by MSBuild!"
+            exit 1
+          }
+          Write-Host "Found driver binary at: $($driverFiles[0].FullName)"
+          Write-Host "File size: $($driverFiles[0].Length) bytes"
 
   macos-build-and-test:
     name: macOS Test & Endpoint Security Client Verification
@@ -96,7 +134,21 @@ jobs:
 
       - name: Compile Apple EndpointSecurity C Client
         run: |
-          clang -Wall -Wextra -Werror \
+          mkdir -p target
+          clang -Wall -Wextra -Werror -fblocks \
             -framework EndpointSecurity -framework Foundation \
             crates/kernlock-platform/extension/macos/main.c \
             -o target/kernlock_es_client -c
+
+      - name: Build macOS System Extension Xcode Project
+        run: |
+          xcodebuild -project crates/kernlock-platform/extension/macos/KernLockExtension.xcodeproj \
+            -target KernLockExtension \
+            -configuration Release \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_ENTITLEMENTS=""
+
+      - name: Verify macOS System Extension binary exists
+        run: |
+          find . -name "com.kernlock.security.dext" -o -name "com.kernlock.security.dext.systemextension"
