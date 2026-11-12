@@ -2,6 +2,7 @@ use kernlock_core::QuarantineStatus;
 use kernlock_quarantine::{FailureInjection, QuarantineError, QuarantineManager};
 use kernlock_storage::Storage;
 use std::fs;
+use std::path::Path;
 use tempfile::TempDir;
 
 #[test]
@@ -506,9 +507,7 @@ fn startup_recovery_audits_and_recovers_crashes_at_every_deletion_stage() {
         staged_path4.exists(),
         "Unverified / corrupted file must NEVER be deleted automatically"
     );
-    assert!(report
-        .unverified_stranded_files
-        .contains(&staged_path4.display().to_string()));
+    assert!(report.contains_unverified_path(&staged_path4.display().to_string()));
 
     // Assertions for Scenario 5: Verified duplicate staging file was safely cleaned up
     assert!(
@@ -521,7 +520,253 @@ fn startup_recovery_audits_and_recovers_crashes_at_every_deletion_stage() {
         staged_unknown.exists(),
         "Unknown staging file must NOT be deleted without verification"
     );
-    assert!(report
-        .unverified_stranded_files
-        .contains(&staged_unknown.display().to_string()));
+    assert!(report.contains_unverified_path(&staged_unknown.display().to_string()));
+}
+
+#[test]
+fn staging_cleanup_requires_independently_verified_copy() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    // Case A: Staging file valid, but vault copy is corrupted -> staging file preserved
+    let t_a = tmp.path().join("case_a.bin");
+    fs::write(&t_a, b"valid payload A").unwrap();
+    let rec_a = qm.quarantine_file(&t_a, "case A").unwrap();
+    let staged_a = vault_dir.join(format!(".kernlock_staging_{}", uuid::Uuid::new_v4()));
+    fs::write(&staged_a, b"valid payload A").unwrap();
+    // Corrupt vault file
+    fs::write(&rec_a.vault_path, b"corrupted vault payload A").unwrap();
+
+    // Case B: Staging file valid, but original copy is corrupted (and vault missing) -> staging file preserved
+    let t_b = tmp.path().join("case_b.bin");
+    fs::write(&t_b, b"valid payload B").unwrap();
+    let rec_b = qm.quarantine_file(&t_b, "case B").unwrap();
+    let staged_b = vault_dir.join(format!(".kernlock_staging_{}", uuid::Uuid::new_v4()));
+    fs::write(&staged_b, b"valid payload B").unwrap();
+    // Remove vault file, put corrupted file at original path
+    fs::remove_file(&rec_b.vault_path).unwrap();
+    fs::write(&rec_b.original_path, b"corrupted original payload B").unwrap();
+
+    // Case C: Staging file valid, but both vault and original are missing -> staging file preserved
+    let t_c = tmp.path().join("case_c.bin");
+    fs::write(&t_c, b"valid payload C").unwrap();
+    let rec_c = qm.quarantine_file(&t_c, "case C").unwrap();
+    let staged_c = vault_dir.join(format!(".kernlock_staging_{}", uuid::Uuid::new_v4()));
+    fs::write(&staged_c, b"valid payload C").unwrap();
+    fs::remove_file(&rec_c.vault_path).unwrap();
+    if Path::new(&rec_c.original_path).exists() {
+        fs::remove_file(&rec_c.original_path).unwrap();
+    }
+
+    // Case D: Staging file valid, and vault copy is intact and verified -> staging file safely deleted
+    let t_d = tmp.path().join("case_d.bin");
+    fs::write(&t_d, b"valid payload D").unwrap();
+    let _rec_d = qm.quarantine_file(&t_d, "case D").unwrap();
+    let staged_d = vault_dir.join(format!(".kernlock_staging_{}", uuid::Uuid::new_v4()));
+    fs::write(&staged_d, b"valid payload D").unwrap();
+
+    let report = qm.recover_on_startup().unwrap();
+
+    assert!(
+        staged_a.exists(),
+        "Staging copy A must be preserved because vault copy is corrupted"
+    );
+    assert!(report.contains_unverified_path(&staged_a.display().to_string()));
+
+    assert!(
+        staged_b.exists(),
+        "Staging copy B must be preserved because original copy is corrupted"
+    );
+    assert!(report.contains_unverified_path(&staged_b.display().to_string()));
+
+    assert!(
+        staged_c.exists(),
+        "Staging copy C must be preserved because both copies are missing"
+    );
+    assert!(report.contains_unverified_path(&staged_c.display().to_string()));
+
+    assert!(
+        !staged_d.exists(),
+        "Staging copy D must be cleaned up because vault copy is independently verified"
+    );
+}
+
+#[test]
+fn deleting_recovery_reports_unresolved_when_files_missing_or_tampered() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    // 1. Missing payload in Deleting state: must NOT mark Deleted! Must preserve Deleting and report unresolved.
+    let t1 = tmp.path().join("missing_deleting.bin");
+    fs::write(&t1, b"payload one").unwrap();
+    let rec1 = qm.quarantine_file(&t1, "missing deleting").unwrap();
+    fs::remove_file(&rec1.vault_path).unwrap();
+    storage
+        .update_quarantine_status(rec1.id, QuarantineStatus::Deleting, None)
+        .unwrap();
+
+    // 2. Tampered payload in Deleting state: vault file has wrong hash
+    let t2 = tmp.path().join("tampered_deleting.bin");
+    fs::write(&t2, b"payload two").unwrap();
+    let rec2 = qm.quarantine_file(&t2, "tampered deleting").unwrap();
+    fs::write(&rec2.vault_path, b"TAMPERED CONTENT IN VAULT").unwrap();
+    storage
+        .update_quarantine_status(rec2.id, QuarantineStatus::Deleting, None)
+        .unwrap();
+
+    let report = qm.recover_on_startup().unwrap();
+
+    // rec1 must remain in Deleting status
+    let rec1_after = storage.get_quarantine(rec1.id).unwrap();
+    assert_eq!(
+        rec1_after.status,
+        QuarantineStatus::Deleting,
+        "Record with missing files must NEVER be marked Deleted automatically"
+    );
+    assert!(
+        report
+            .unresolved_states
+            .iter()
+            .any(|u| u.id == rec1.id && u.status == QuarantineStatus::Deleting),
+        "Unresolved state must be recorded for missing payload in Deleting"
+    );
+
+    // rec2 must also remain in Deleting status with unverified stranded file recorded
+    let rec2_after = storage.get_quarantine(rec2.id).unwrap();
+    assert_eq!(rec2_after.status, QuarantineStatus::Deleting);
+    assert!(report.contains_unverified_path(&rec2.vault_path));
+    assert!(report.unresolved_states.iter().any(|u| u.id == rec2.id));
+}
+
+#[test]
+fn concurrent_restore_and_delete_operations_are_race_safe() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let qm = Arc::new(QuarantineManager::new(tmp.path().join("vault"), storage.clone()).unwrap());
+
+    let target = tmp.path().join("race_target.bin");
+    fs::write(&target, b"important user document").unwrap();
+    let rec = qm.quarantine_file(&target, "race test").unwrap();
+    let rec_id = rec.id;
+
+    let barrier = Arc::new(Barrier::new(2));
+
+    let qm_restore = Arc::clone(&qm);
+    let barrier_restore = Arc::clone(&barrier);
+    let h_restore = thread::spawn(move || {
+        barrier_restore.wait();
+        qm_restore.restore_file(rec_id)
+    });
+
+    let qm_delete = Arc::clone(&qm);
+    let barrier_delete = Arc::clone(&barrier);
+    let h_delete = thread::spawn(move || {
+        barrier_delete.wait();
+        qm_delete.delete_permanently(rec_id)
+    });
+
+    let res_restore = h_restore.join().unwrap();
+    let res_delete = h_delete.join().unwrap();
+
+    // Exactly one must succeed and the other must fail with InvalidState
+    let final_record = storage.get_quarantine(rec_id).unwrap();
+    match (res_restore, res_delete) {
+        (Ok(_), Err(QuarantineError::InvalidState(_))) => {
+            // Restore won the race
+            assert_eq!(final_record.status, QuarantineStatus::Restored);
+            assert!(
+                target.exists(),
+                "Restored file must exist at original target"
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"important user document");
+        }
+        (Err(QuarantineError::InvalidState(_)), Ok(())) => {
+            // Delete won the race
+            assert_eq!(final_record.status, QuarantineStatus::Deleted);
+            assert!(!target.exists(), "Target must not exist");
+            assert!(
+                !Path::new(&rec.vault_path).exists(),
+                "Vault file must not exist"
+            );
+        }
+        (r, d) => {
+            panic!("Expected one success and one InvalidState, got restore={r:?}, delete={d:?}")
+        }
+    }
+}
+
+#[test]
+fn startup_recovery_handles_interrupted_restore() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    // Scenario 1: Interrupted restore AFTER file was moved to destination
+    // File at original_path is valid, vault file is gone, DB is Restoring -> recovers to Restored
+    let t1 = tmp.path().join("restore_after_move.bin");
+    fs::write(&t1, b"restore payload 1").unwrap();
+    let rec1 = qm.quarantine_file(&t1, "restore 1").unwrap();
+    // Simulate crash after move
+    fs::rename(&rec1.vault_path, &rec1.original_path).unwrap();
+    storage
+        .update_quarantine_status(rec1.id, QuarantineStatus::Restoring, None)
+        .unwrap();
+
+    // Scenario 2: Interrupted restore BEFORE file was moved
+    // Vault file is valid, original_path does not exist, DB is Restoring -> reverts to Quarantined
+    let t2 = tmp.path().join("restore_before_move.bin");
+    fs::write(&t2, b"restore payload 2").unwrap();
+    let rec2 = qm.quarantine_file(&t2, "restore 2").unwrap();
+    storage
+        .update_quarantine_status(rec2.id, QuarantineStatus::Restoring, None)
+        .unwrap();
+
+    // Scenario 3: Interrupted restore where BOTH exist -> leave in Restoring, report unresolved
+    let t3 = tmp.path().join("restore_both_exist.bin");
+    fs::write(&t3, b"restore payload 3").unwrap();
+    let rec3 = qm.quarantine_file(&t3, "restore 3").unwrap();
+    fs::write(&rec3.original_path, b"restore payload 3").unwrap();
+    storage
+        .update_quarantine_status(rec3.id, QuarantineStatus::Restoring, None)
+        .unwrap();
+
+    // Run recovery
+    let report = qm.recover_on_startup().unwrap();
+
+    // Scenario 1: Finalized to Restored
+    assert!(report.finalized_restores.contains(&rec1.id));
+    assert_eq!(
+        storage.get_quarantine(rec1.id).unwrap().status,
+        QuarantineStatus::Restored
+    );
+    assert!(Path::new(&rec1.original_path).is_file());
+
+    // Scenario 2: Reverted to Quarantined
+    assert!(report.recovered_to_quarantine.contains(&rec2.id));
+    assert_eq!(
+        storage.get_quarantine(rec2.id).unwrap().status,
+        QuarantineStatus::Quarantined
+    );
+    assert!(Path::new(&rec2.vault_path).is_file());
+
+    // Scenario 3: Left in Restoring, reported in unresolved_states
+    assert_eq!(
+        storage.get_quarantine(rec3.id).unwrap().status,
+        QuarantineStatus::Restoring
+    );
+    assert!(report.unresolved_states.iter().any(|u| u.id == rec3.id));
+
+    // Verify idempotency: running recovery a second time produces no new finalized actions or failures
+    let second_report = qm.recover_on_startup().unwrap();
+    assert!(second_report.finalized_restores.is_empty());
+    assert!(second_report.recovered_to_quarantine.is_empty());
+    assert!(second_report.recovery_failures.is_empty());
 }

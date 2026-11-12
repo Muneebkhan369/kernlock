@@ -10,6 +10,7 @@
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
     "prepare:sidecar:release": "node scripts/prepare-sidecar.mjs --release",
     "sidecar:check": "node scripts/prepare-sidecar.mjs --check",
+    "test:sidecar": "node scripts/test-sidecar-validator.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"

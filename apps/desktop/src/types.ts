@@ -1,7 +1,7 @@
 export type SecurityMode = "audit" | "protection" | "strict";
 export type Severity = "info" | "low" | "medium" | "high" | "critical";
 export type AlertStatus = "open" | "acknowledged" | "quarantined" | "resolved" | "false_positive";
-export type QuarantineStatus = "quarantined" | "restored" | "deleted";
+export type QuarantineStatus = "quarantined" | "restoring" | "restored" | "deleting" | "deleted";
 
 export interface RuleMatch {
   rule_id: string;

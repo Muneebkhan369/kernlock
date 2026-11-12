@@ -35,6 +35,14 @@
 - [x] Startup quarantine recovery audit (`QuarantineManager::recover_on_startup`) recovering interrupted `Deleting`/`Deleted` staging files with mandatory SHA-256 verification (never deletes unverified files)
 - [x] Clean-installation simulation testing with empty `PATH` and documented Linux packaging prerequisites (`gdk-3.0` / WebKitGTK)
 
+## Phase 1.4.1 — Quarantine Integrity, Crash Recovery and Race-Safety (Completed)
+- [x] Verified staging-file cleanup: never deletes `.kernlock_staging_*` without an independently verified good copy (`read_regular_nofollow` + SHA-256) in vault or original location
+- [x] Incomplete `Deleting`-state recovery: preserves `Deleting` state and reports `unresolved_states` when files are missing, never silently marking `Deleted`
+- [x] Explicit recovery reporting: zero ignored errors (`let _ =`), structured `RecoveryAuditReport` with `unverified_stranded_files`, `recovery_failures`, and `unresolved_states`
+- [x] Atomic compare-and-set (CAS) race-safety: conditional status transitions (`Quarantined` -> `Restoring` -> `Restored`, `Quarantined` -> `Deleting` -> `Deleted`) preventing concurrent operation collisions
+- [x] Interrupted restore recovery: startup audit safely recovers `Restoring` records to `Restored` (if destination verified) or `Quarantined` (if vault verified), with destination collision protection
+- [x] Sidecar architecture validator hardening: whitelist supported triples (`x86_64` and `aarch64` for Linux, Windows, macOS), fail closed on unsupported triples, correct Mach-O endianness handling (LE vs BE), and comprehensive automated validator test suite (`npm run test:sidecar`)
+
 ## Phase 2 — Privileged Linux Enforcement & YARA/Sigma Parity
 - [ ] Privileged `fanotify` (`FAN_OPEN_PERM`) helper daemon with PolicyKit/sudo privilege separation
 - [ ] Optional `libyara` / `yara-x` integration for native `.yar` rule files

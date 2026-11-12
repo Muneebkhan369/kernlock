@@ -8,6 +8,18 @@ const desktopDir = path.resolve(__dirname, "..");
 const repoRoot = path.resolve(desktopDir, "../..");
 const binariesDir = path.join(desktopDir, "src-tauri", "binaries");
 
+export const SUPPORTED_TARGET_TRIPLES = [
+  "x86_64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-unknown-linux-musl",
+  "x86_64-pc-windows-msvc",
+  "x86_64-pc-windows-gnu",
+  "aarch64-pc-windows-msvc",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+];
+
 function getHostTargetTriple() {
   const rustcInfo = execFileSync("rustc", ["-vV"], { encoding: "utf8" });
   const hostLine = rustcInfo
@@ -21,16 +33,29 @@ function getHostTargetTriple() {
 
 function parseTargetTriple() {
   const targetIdx = process.argv.indexOf("--target");
+  let triple;
   if (targetIdx !== -1 && process.argv[targetIdx + 1]) {
-    return process.argv[targetIdx + 1].trim();
+    triple = process.argv[targetIdx + 1].trim();
+  } else if (process.env.TAURI_ENV_TARGET_TRIPLE) {
+    triple = process.env.TAURI_ENV_TARGET_TRIPLE.trim();
+  } else {
+    triple = getHostTargetTriple();
   }
-  if (process.env.TAURI_ENV_TARGET_TRIPLE) {
-    return process.env.TAURI_ENV_TARGET_TRIPLE.trim();
+  if (!SUPPORTED_TARGET_TRIPLES.includes(triple)) {
+    throw new Error(
+      `Unsupported target triple: '${triple}'. Supported triples are: ${SUPPORTED_TARGET_TRIPLES.join(", ")}`
+    );
   }
-  return getHostTargetTriple();
+  return triple;
 }
 
 export function validateBinaryArchitecture(filePath, expectedTriple) {
+  if (!SUPPORTED_TARGET_TRIPLES.includes(expectedTriple)) {
+    throw new Error(
+      `Unsupported target triple: '${expectedTriple}'. Supported triples are: ${SUPPORTED_TARGET_TRIPLES.join(", ")}`
+    );
+  }
+
   if (!fs.existsSync(filePath)) {
     throw new Error(`Binary file does not exist: ${filePath}`);
   }
@@ -93,13 +118,20 @@ export function validateBinaryArchitecture(filePath, expectedTriple) {
       }
     }
   } else if (expectedTriple.includes("apple") || expectedTriple.includes("darwin")) {
-    // macOS Mach-O validation
-    const magic = buf.readUInt32LE(0);
-    // 0xfeedfacf (64-bit LE) or 0xcffaedfe (64-bit BE)
-    if (magic !== 0xfeedfacf && magic !== 0xcffaedfe) {
-      throw new Error(`Expected 64-bit Mach-O binary for ${expectedTriple}, but magic=0x${magic.toString(16)} in ${filePath}`);
+    // macOS Mach-O validation with proper endianness handling
+    const magicLe = buf.readUInt32LE(0);
+    const magicBe = buf.readUInt32BE(0);
+    let isLe;
+    if (magicLe === 0xfeedfacf) {
+      isLe = true;
+    } else if (magicBe === 0xfeedfacf || magicLe === 0xcffaedfe) {
+      isLe = false;
+    } else {
+      throw new Error(
+        `Expected 64-bit Mach-O binary for ${expectedTriple}, but magic=0x${magicLe.toString(16)} in ${filePath}`
+      );
     }
-    const cpuType = buf.readUInt32LE(4);
+    const cpuType = isLe ? buf.readUInt32LE(4) : buf.readUInt32BE(4);
     if (expectedTriple.startsWith("x86_64")) {
       if (cpuType !== 0x01000007) {
         throw new Error(
@@ -124,6 +156,13 @@ function runCheck() {
   const sidecars = files.filter((f) => f.startsWith("kernlock-"));
   if (sidecars.length === 0) {
     throw new Error(`No sidecar binaries found in ${binariesDir}`);
+  }
+  const hostTriple = getHostTargetTriple();
+  const hostSidecar = sidecars.find(
+    (f) => f === `kernlock-${hostTriple}` || f === `kernlock-${hostTriple}.exe`
+  );
+  if (!hostSidecar) {
+    console.warn(`[WARN] Host target sidecar (kernlock-${hostTriple}) is not yet prepared in ${binariesDir}`);
   }
   for (const file of sidecars) {
     const filePath = path.join(binariesDir, file);

@@ -36,10 +36,13 @@ impl KernLockEngine {
         let recovery_report = quarantine.recover_on_startup()?;
         if !recovery_report.is_empty() {
             info!(
-                "Quarantine startup recovery audit: {} recovered, {} finalized deletions, {} unverified stranded files",
+                "Quarantine startup recovery audit: {} recovered, {} finalized deletions, {} finalized restores, {} unverified stranded files, {} failures, {} unresolved states",
                 recovery_report.recovered_to_quarantine.len(),
                 recovery_report.finalized_deletions.len(),
-                recovery_report.unverified_stranded_files.len()
+                recovery_report.finalized_restores.len(),
+                recovery_report.unverified_stranded_files.len(),
+                recovery_report.recovery_failures.len(),
+                recovery_report.unresolved_states.len(),
             );
         }
         let rules = Arc::new(RuleEngine::builtin());

@@ -209,6 +209,7 @@ pub struct QuarantineRecord {
 #[serde(rename_all = "snake_case")]
 pub enum QuarantineStatus {
     Quarantined,
+    Restoring,
     Restored,
     Deleting,
     Deleted,

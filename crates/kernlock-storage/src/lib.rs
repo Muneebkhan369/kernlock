@@ -449,6 +449,61 @@ impl Storage {
         Ok(out)
     }
 
+    pub fn transition_quarantine_status(
+        &self,
+        id: Uuid,
+        expected: QuarantineStatus,
+        target: QuarantineStatus,
+        restored_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        let updated = conn.execute(
+            "UPDATE quarantine_records SET status = ?1, restored_at = ?2 WHERE id = ?3 AND status = ?4",
+            params![
+                serde_json::to_string(&target)?,
+                restored_at.map(|d| d.to_rfc3339()),
+                id.to_string(),
+                serde_json::to_string(&expected)?
+            ],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn transition_quarantine_status_from_any(
+        &self,
+        id: Uuid,
+        expected_any: &[QuarantineStatus],
+        target: QuarantineStatus,
+        restored_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        if expected_any.is_empty() {
+            return Ok(false);
+        }
+        let placeholders: Vec<String> = (4..4 + expected_any.len())
+            .map(|i| format!("?{}", i))
+            .collect();
+        let query = format!(
+            "UPDATE quarantine_records SET status = ?1, restored_at = ?2 WHERE id = ?3 AND status IN ({})",
+            placeholders.join(", ")
+        );
+        let target_json = serde_json::to_string(&target)?;
+        let restored_rfc = restored_at.map(|d| d.to_rfc3339());
+        let id_str = id.to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(target_json),
+            Box::new(restored_rfc),
+            Box::new(id_str),
+        ];
+        for st in expected_any {
+            params_vec.push(Box::new(serde_json::to_string(st)?));
+        }
+        let params_slice: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let updated = conn.execute(&query, rusqlite::params_from_iter(params_slice))?;
+        Ok(updated > 0)
+    }
+
     pub fn update_quarantine_status(
         &self,
         id: Uuid,
