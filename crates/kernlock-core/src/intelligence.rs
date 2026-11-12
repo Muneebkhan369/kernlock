@@ -30,6 +30,18 @@ pub enum IntelligenceError {
 pub const OFFICIAL_PUBLIC_KEY_HEX: &str =
     "69d50c0ac704c7d545b942deb8427f610a0611e1a5194cc09d0f5ffd9a71d181";
 
+/// Built-in baseline definition version string
+pub const BUILTIN_BASELINE_VERSION: &str = "2026.11.1";
+
+/// Fixed deterministic timestamp (2026-11-01T00:00:00Z) for the built-in baseline definitions.
+/// Eliminates non-deterministic `Utc::now()` baseline initialization across daemon restarts.
+pub const BUILTIN_BASELINE_TIMESTAMP_UNIX: i64 = 1762041600;
+
+pub fn builtin_baseline_timestamp() -> DateTime<Utc> {
+    DateTime::from_timestamp(BUILTIN_BASELINE_TIMESTAMP_UNIX, 0)
+        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefinitionStatus {
     pub version: String,

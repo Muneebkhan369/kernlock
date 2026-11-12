@@ -2,10 +2,11 @@ use crate::scanner::ScanManager;
 use anyhow::Result;
 use chrono::Utc;
 use kernlock_core::{
-    analyze_command, AlertStatus, CommandAnalysisResult, DefinitionStatus, EventCategory,
-    FileScanResult, PersistenceEntry, PlatformCapabilities, PolicyConfig, ProcessInfo,
-    QuarantineRecord, RuleEngine, SecurityEvent, SecurityMode, SecurityReport, Severity,
-    SignedThreatBundle, ThreatAlert, OFFICIAL_PUBLIC_KEY_HEX,
+    analyze_command, builtin_baseline_timestamp, AlertStatus, CommandAnalysisResult,
+    DefinitionStatus, EventCategory, FileScanResult, PersistenceEntry, PlatformCapabilities,
+    PolicyConfig, ProcessInfo, QuarantineRecord, RuleEngine, SecurityEvent, SecurityMode,
+    SecurityReport, Severity, SignedThreatBundle, ThreatAlert, BUILTIN_BASELINE_VERSION,
+    OFFICIAL_PUBLIC_KEY_HEX,
 };
 use kernlock_platform::{
     default_provider, fanotify::FanotifyPermissionMonitor, PlatformSecurityProvider,
@@ -31,6 +32,7 @@ pub struct KernLockEngine {
     fanotify_monitor: Arc<Mutex<Option<FanotifyPermissionMonitor>>>,
     definitions_status: Arc<Mutex<DefinitionStatus>>,
     trusted_keys: Arc<RwLock<HashSet<String>>>,
+    update_lock: Arc<Mutex<()>>,
 }
 
 impl KernLockEngine {
@@ -63,18 +65,62 @@ impl KernLockEngine {
             provider.clone(),
         );
 
-        let definitions_status = Arc::new(Mutex::new(DefinitionStatus {
-            version: "2026.11.1-builtin".to_string(),
-            last_updated: Utc::now(),
-            rule_count: rules.rule_count(),
-            hash_signature_count: 5,
-            byte_signature_count: 5,
-            official_public_key: OFFICIAL_PUBLIC_KEY_HEX.to_string(),
-        }));
-
         let mut initial_trusted = HashSet::new();
         initial_trusted.insert(OFFICIAL_PUBLIC_KEY_HEX.to_lowercase());
+        if let Ok(persisted_keys) = storage.list_trusted_keys() {
+            for k in persisted_keys {
+                initial_trusted.insert(k.to_lowercase());
+            }
+        }
         let trusted_keys = Arc::new(RwLock::new(initial_trusted));
+
+        // Restore persisted threat definitions from database if available
+        let mut initial_version = BUILTIN_BASELINE_VERSION.to_string();
+        let mut initial_timestamp = builtin_baseline_timestamp();
+        let mut hash_count = 5;
+        let mut byte_count = 5;
+
+        if let Ok(Some(persisted_bundle)) = storage.load_threat_bundle() {
+            let mut is_valid = false;
+            let current_trusted = trusted_keys.read().unwrap();
+            for trusted in current_trusted.iter() {
+                if persisted_bundle.verify_with_hex_key(trusted).is_ok() {
+                    is_valid = true;
+                    break;
+                }
+            }
+            drop(current_trusted);
+
+            if is_valid {
+                info!(
+                    "Restoring persisted threat definitions v{} (timestamp {})",
+                    persisted_bundle.manifest.version, persisted_bundle.manifest.timestamp
+                );
+                initial_version = persisted_bundle.manifest.version.clone();
+                initial_timestamp = persisted_bundle.manifest.timestamp;
+                hash_count = persisted_bundle.manifest.hash_signatures.len();
+                byte_count = persisted_bundle.manifest.byte_signatures.len();
+
+                if let Err(e) = rules.replace_definitions(
+                    persisted_bundle.manifest.rules,
+                    persisted_bundle.manifest.hash_signatures,
+                    persisted_bundle.manifest.byte_signatures,
+                ) {
+                    warn!("Failed to activate persisted rules: {}", e);
+                }
+            } else {
+                warn!("Persisted threat bundle failed signature verification against trusted keys; reverting to baseline");
+            }
+        }
+
+        let definitions_status = Arc::new(Mutex::new(DefinitionStatus {
+            version: initial_version,
+            last_updated: initial_timestamp,
+            rule_count: rules.rule_count(),
+            hash_signature_count: hash_count,
+            byte_signature_count: byte_count,
+            official_public_key: OFFICIAL_PUBLIC_KEY_HEX.to_string(),
+        }));
 
         Ok(Self {
             rules,
@@ -86,12 +132,15 @@ impl KernLockEngine {
             fanotify_monitor: Arc::new(Mutex::new(None)),
             definitions_status,
             trusted_keys,
+            update_lock: Arc::new(Mutex::new(())),
         })
     }
 
     pub fn add_trusted_key_hex(&self, key_hex: &str) {
+        let clean = key_hex.trim().to_lowercase();
+        let _ = self.storage.add_trusted_key(&clean);
         if let Ok(mut guard) = self.trusted_keys.write() {
-            guard.insert(key_hex.trim().to_lowercase());
+            guard.insert(clean);
         }
     }
 
@@ -111,6 +160,12 @@ impl KernLockEngine {
     }
 
     pub fn update_definitions(&self, bundle: SignedThreatBundle) -> Result<DefinitionStatus> {
+        // Prevent concurrent update races
+        let _lock = self
+            .update_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Update lock poisoned"))?;
+
         // 1. Verify bundle against explicitly pinned trusted keys ONLY
         let trusted_keys = self
             .trusted_keys
@@ -147,7 +202,12 @@ impl KernLockEngine {
         )
         .map_err(|e| anyhow::anyhow!("Version rollback rejected: {}", e))?;
 
-        // 3. Atomically replace rules AND dynamic hash/byte signatures in scanner engine
+        // 3. Persist bundle to database BEFORE activating in-memory (transactional guarantee)
+        self.storage.save_threat_bundle(&bundle).map_err(|e| {
+            anyhow::anyhow!("Failed to persist threat definitions to database: {}", e)
+        })?;
+
+        // 4. Atomically replace rules AND dynamic hash/byte signatures in scanner engine
         let new_rule_count = bundle.manifest.rules.len();
         let new_hash_count = bundle.manifest.hash_signatures.len();
         let new_byte_count = bundle.manifest.byte_signatures.len();
@@ -160,7 +220,7 @@ impl KernLockEngine {
             )
             .map_err(|e| anyhow::anyhow!("Failed to compile updated threat definitions: {}", e))?;
 
-        // 4. Update cached status only after atomic replacement succeeds
+        // 5. Update cached status only after atomic replacement succeeds
         let mut status = self
             .definitions_status
             .lock()
@@ -207,6 +267,17 @@ impl KernLockEngine {
         }
     }
 
+    pub fn fanotify_health(&self) -> kernlock_platform::fanotify::FanotifyMonitorHealth {
+        if let Ok(guard) = self.fanotify_monitor.lock() {
+            guard
+                .as_ref()
+                .map(|m| m.health())
+                .unwrap_or(kernlock_platform::fanotify::FanotifyMonitorHealth::Uninitialized)
+        } else {
+            kernlock_platform::fanotify::FanotifyMonitorHealth::Failed
+        }
+    }
+
     pub fn start_fanotify_monitor(&self) {
         if !FanotifyPermissionMonitor::is_supported() {
             info!("fanotify is not supported on this host/environment; skipping kernel permission monitor");
@@ -235,6 +306,212 @@ impl KernLockEngine {
             Err(e) => {
                 warn!("Unable to initialize fanotify permission monitor: {}", e);
             }
+        }
+    }
+
+    pub fn evaluate_authorization_request(&self, path_str: &str, pid: i32, is_exec: bool) -> bool {
+        let path = Path::new(path_str);
+        let policy = self.storage.get_policy().unwrap_or_default();
+
+        // 1. Audit mode observes and allows
+        if policy.mode == SecurityMode::Audit {
+            return false;
+        }
+
+        // 2. Policy path exclusions
+        if policy.is_path_excluded(path) {
+            return false;
+        }
+
+        // 3. Scan file content directly using bounded streaming reader
+        if path.is_file() {
+            if let Ok(mut file) = std::fs::File::open(path) {
+                if let Ok(res) = kernlock_core::analyzer::scan_stream_reader(
+                    &mut file,
+                    path_str,
+                    &self.rules,
+                    &policy,
+                ) {
+                    if res.is_suspicious || res.risk_score >= policy.auto_quarantine_threshold {
+                        let action = if is_exec {
+                            "KernelExecutionBlocked"
+                        } else {
+                            "KernelFileAccessBlocked"
+                        };
+
+                        let event = SecurityEvent {
+                            id: Uuid::new_v4(),
+                            timestamp: Utc::now(),
+                            category: if is_exec {
+                                EventCategory::Process
+                            } else {
+                                EventCategory::File
+                            },
+                            severity: res.severity,
+                            title: format!(
+                                "{} Blocked: {}",
+                                if is_exec { "Execution" } else { "Access" },
+                                res.threat_name.as_deref().unwrap_or("Malicious File")
+                            ),
+                            description: format!(
+                                "Kernel authorization blocked PID {} from {} file {}",
+                                pid,
+                                if is_exec { "executing" } else { "opening" },
+                                path_str
+                            ),
+                            target: path_str.to_string(),
+                            risk_score: res.risk_score,
+                            action_taken: action.to_string(),
+                            rule_ids: res.matches.iter().map(|m| m.rule_id.clone()).collect(),
+                            metadata: serde_json::json!({
+                                "pid": pid,
+                                "sha256": res.sha256,
+                                "threat_name": res.threat_name,
+                                "is_exec": is_exec,
+                            }),
+                        };
+
+                        let alert = ThreatAlert {
+                            id: Uuid::new_v4(),
+                            event_id: event.id,
+                            timestamp: event.timestamp,
+                            severity: res.severity,
+                            title: event.title.clone(),
+                            explanation: res.summary.clone(),
+                            target: path_str.to_string(),
+                            risk_score: res.risk_score,
+                            status: AlertStatus::Open,
+                            recommended_action: if is_exec {
+                                "Execution was blocked. Terminate invoking process and quarantine payload."
+                                    .to_string()
+                            } else {
+                                "Access was blocked. Quarantine payload and inspect logs."
+                                    .to_string()
+                            },
+                        };
+
+                        let _ = self.storage.insert_event(&event);
+                        let _ = self.storage.insert_alert(&alert);
+
+                        return true; // BLOCKED
+                    }
+                }
+            }
+        }
+
+        false // ALLOWED
+    }
+
+    #[cfg(unix)]
+    pub fn start_unix_socket_server(&self, data_dir: &Path) {
+        let engine = self.clone();
+        let fallback_path = data_dir.join("kernlock.sock");
+
+        tokio::spawn(async move {
+            let primary_dir = Path::new("/var/run/kernlock");
+            let sock_path = if std::fs::create_dir_all(primary_dir).is_ok() {
+                primary_dir.join("kernlock.sock")
+            } else {
+                fallback_path
+            };
+
+            if sock_path.exists() {
+                let _ = std::fs::remove_file(&sock_path);
+            }
+
+            let listener = match tokio::net::UnixListener::bind(&sock_path) {
+                Ok(l) => {
+                    info!(
+                        "Unix domain socket server listening on {}",
+                        sock_path.display()
+                    );
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &sock_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                    l
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to bind Unix domain socket at {}: {}",
+                        sock_path.display(),
+                        e
+                    );
+                    return;
+                }
+            };
+
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let eng = engine.clone();
+                        tokio::spawn(async move {
+                            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                            let (reader, mut writer) = stream.into_split();
+                            let mut lines = BufReader::new(reader).lines();
+
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                let trimmed = line.trim();
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+                                {
+                                    if val.get("action").and_then(|v| v.as_str()) == Some("eval_es")
+                                    {
+                                        let path_str =
+                                            val.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                                        let pid =
+                                            val.get("pid").and_then(|v| v.as_i64()).unwrap_or(0)
+                                                as i32;
+                                        let is_exec = val
+                                            .get("is_exec")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false);
+
+                                        let blocked = eng
+                                            .evaluate_authorization_request(path_str, pid, is_exec);
+                                        let resp = if blocked {
+                                            "{\"verdict\":\"block\"}\n"
+                                        } else {
+                                            "{\"verdict\":\"allow\"}\n"
+                                        };
+                                        let _ = writer.write_all(resp.as_bytes()).await;
+                                        let _ = writer.flush().await;
+                                    } else {
+                                        let _ = writer
+                                            .write_all(b"{\"error\":\"unknown_action\"}\n")
+                                            .await;
+                                        let _ = writer.flush().await;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        warn!("Unix socket accept error: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn start_windows_minifilter(&self) {
+        #[cfg(target_os = "windows")]
+        {
+            let engine = self.clone();
+            let rules = self.rules.clone();
+            let engine_for_policy = self.clone();
+            let policy_provider =
+                Arc::new(move || engine_for_policy.get_policy().unwrap_or_default());
+            let client = kernlock_platform::windows::MinifilterClient::new();
+            client.start(rules, policy_provider, move |event, alert| {
+                let _ = engine.storage.insert_event(&event);
+                let _ = engine.storage.insert_alert(&alert);
+            });
+            info!("Windows Minifilter listener started");
         }
     }
 

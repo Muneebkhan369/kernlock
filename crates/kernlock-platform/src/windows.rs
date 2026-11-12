@@ -308,54 +308,62 @@ impl MinifilterClient {
             );
         }
 
-        // Perform file content inspection if accessible
+        // Perform bounded streaming file content inspection if accessible
         let is_threat = if path.is_file() {
-            if let Ok(bytes) = fs::read(&path) {
-                let res = analyze_file_bytes(&file_path_str, &bytes, rules, policy);
-                if res.is_suspicious || res.risk_score >= policy.auto_quarantine_threshold {
-                    let event = SecurityEvent {
-                        id: Uuid::new_v4(),
-                        timestamp: chrono::Utc::now(),
-                        category: EventCategory::Process,
-                        severity: res.severity,
-                        title: format!(
-                            "Execution Blocked: {}",
-                            res.threat_name
-                                .as_deref()
-                                .unwrap_or("Malicious Windows Executable")
-                        ),
-                        description: format!(
-                            "Windows Minifilter intercepted execution of {} by PID {}",
-                            file_path_str, pid
-                        ),
-                        target: file_path_str.clone(),
-                        risk_score: res.risk_score,
-                        action_taken: "KernelExecutionBlocked".to_string(),
-                        rule_ids: res.matches.iter().map(|m| m.rule_id.clone()).collect(),
-                        metadata: serde_json::json!({
-                            "pid": pid,
-                            "parent_pid": parent_pid,
-                            "sha256": res.sha256,
-                            "threat_name": res.threat_name,
-                            "altitude": KERNLOCK_FILTER_ALTITUDE,
-                        }),
-                    };
+            if let Ok(mut file) = fs::File::open(&path) {
+                if let Ok(res) = kernlock_core::analyzer::scan_stream_reader(
+                    &mut file,
+                    &file_path_str,
+                    rules,
+                    policy,
+                ) {
+                    if res.is_suspicious || res.risk_score >= policy.auto_quarantine_threshold {
+                        let event = SecurityEvent {
+                            id: Uuid::new_v4(),
+                            timestamp: chrono::Utc::now(),
+                            category: EventCategory::Process,
+                            severity: res.severity,
+                            title: format!(
+                                "Execution Blocked: {}",
+                                res.threat_name
+                                    .as_deref()
+                                    .unwrap_or("Malicious Windows Executable")
+                            ),
+                            description: format!(
+                                "Windows Minifilter intercepted execution of {} by PID {}",
+                                file_path_str, pid
+                            ),
+                            target: file_path_str.clone(),
+                            risk_score: res.risk_score,
+                            action_taken: "KernelExecutionBlocked".to_string(),
+                            rule_ids: res.matches.iter().map(|m| m.rule_id.clone()).collect(),
+                            metadata: serde_json::json!({
+                                "pid": pid,
+                                "parent_pid": parent_pid,
+                                "sha256": res.sha256,
+                                "threat_name": res.threat_name,
+                                "altitude": KERNLOCK_FILTER_ALTITUDE,
+                            }),
+                        };
 
-                    let alert = ThreatAlert {
-                        id: Uuid::new_v4(),
-                        event_id: event.id,
-                        timestamp: event.timestamp,
-                        severity: res.severity,
-                        title: event.title.clone(),
-                        explanation: res.summary.clone(),
-                        target: file_path_str.clone(),
-                        risk_score: res.risk_score,
-                        status: AlertStatus::Open,
-                        recommended_action: "Execution was blocked via Filter Manager (FLTMGR). Quarantine binary and inspect process lineage.".to_string(),
-                    };
+                        let alert = ThreatAlert {
+                            id: Uuid::new_v4(),
+                            event_id: event.id,
+                            timestamp: event.timestamp,
+                            severity: res.severity,
+                            title: event.title.clone(),
+                            explanation: res.summary.clone(),
+                            target: file_path_str.clone(),
+                            risk_score: res.risk_score,
+                            status: AlertStatus::Open,
+                            recommended_action: "Execution was blocked via Filter Manager (FLTMGR). Quarantine binary and inspect process lineage.".to_string(),
+                        };
 
-                    on_threat(event, alert);
-                    true
+                        on_threat(event, alert);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -415,7 +423,7 @@ impl MinifilterClient {
         }
     }
 
-    /// Start the Filter Manager communication loop on Windows
+    /// Start the Filter Manager communication loop on Windows with reconnect capability
     pub fn start<F>(
         &self,
         rules: Arc<RuleEngine>,
@@ -428,86 +436,98 @@ impl MinifilterClient {
         {
             let connected = self.connected.clone();
             std::thread::spawn(move || {
-                let mut port_name_wide: Vec<u16> =
+                let port_name_wide: Vec<u16> =
                     FILTER_PORT_NAME.encode_utf16().chain(Some(0)).collect();
-                let mut h_port: flt_ffi::HANDLE = std::ptr::null_mut();
 
-                let hr = unsafe {
-                    flt_ffi::FilterConnectCommunicationPort(
-                        port_name_wide.as_ptr(),
-                        0,
-                        std::ptr::null(),
-                        0,
-                        std::ptr::null_mut(),
-                        &mut h_port,
-                    )
-                };
+                loop {
+                    let mut h_port: flt_ffi::HANDLE = std::ptr::null_mut();
 
-                if hr != flt_ffi::S_OK || h_port.is_null() {
-                    tracing::warn!(
-                        "Failed to connect to KernLock Windows Minifilter port: 0x{:08X}",
-                        hr
-                    );
-                    connected.store(false, Ordering::Release);
-                    return;
-                }
-
-                connected.store(true, Ordering::Release);
-                tracing::info!(
-                    "Connected to KernLock Windows Minifilter port (altitude {})",
-                    KERNLOCK_FILTER_ALTITUDE
-                );
-
-                let mut msg: FilterMessage<RawExecutionRequestMsg> = unsafe { std::mem::zeroed() };
-                let msg_size = std::mem::size_of::<FilterMessage<RawExecutionRequestMsg>>() as u32;
-
-                while connected.load(Ordering::Acquire) {
                     let hr = unsafe {
-                        flt_ffi::FilterGetMessage(
-                            h_port,
-                            &mut msg as *mut _ as *mut std::ffi::c_void,
-                            msg_size,
+                        flt_ffi::FilterConnectCommunicationPort(
+                            port_name_wide.as_ptr(),
+                            0,
+                            std::ptr::null(),
+                            0,
                             std::ptr::null_mut(),
+                            &mut h_port,
                         )
                     };
 
-                    if hr != flt_ffi::S_OK {
-                        tracing::warn!(
-                            "FilterGetMessage returned error 0x{:08X}; terminating loop",
-                            hr
-                        );
-                        break;
+                    if hr != flt_ffi::S_OK || h_port.is_null() {
+                        connected.store(false, Ordering::Release);
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        continue;
                     }
 
-                    let policy = get_policy();
-                    let raw_reply_data =
-                        Self::new().evaluate_request(&msg.data, &rules, &policy, &on_threat);
+                    connected.store(true, Ordering::Release);
+                    tracing::info!(
+                        "Connected to KernLock Windows Minifilter port (altitude {})",
+                        KERNLOCK_FILTER_ALTITUDE
+                    );
 
-                    let mut reply = FilterReply {
-                        status: 0,
-                        message_id: msg.message_id,
-                        data: raw_reply_data,
-                    };
+                    let mut msg: FilterMessage<RawExecutionRequestMsg> =
+                        unsafe { std::mem::zeroed() };
+                    let msg_size =
+                        std::mem::size_of::<FilterMessage<RawExecutionRequestMsg>>() as u32;
 
-                    let reply_size =
-                        std::mem::size_of::<FilterReply<RawExecutionResponseMsg>>() as u32;
-                    let reply_hr = unsafe {
-                        flt_ffi::FilterReplyMessage(
-                            h_port,
-                            &mut reply as *mut _ as *mut std::ffi::c_void,
-                            reply_size,
-                        )
-                    };
+                    while connected.load(Ordering::Acquire) {
+                        let hr = unsafe {
+                            flt_ffi::FilterGetMessage(
+                                h_port,
+                                &mut msg as *mut _ as *mut std::ffi::c_void,
+                                msg_size,
+                                std::ptr::null_mut(),
+                            )
+                        };
 
-                    if reply_hr != flt_ffi::S_OK {
-                        tracing::warn!("FilterReplyMessage failed: 0x{:08X}", reply_hr);
+                        if hr != flt_ffi::S_OK {
+                            tracing::warn!(
+                                "FilterGetMessage returned error 0x{:08X}; reconnecting port",
+                                hr
+                            );
+                            break;
+                        }
+
+                        // Validate message ID integrity
+                        if msg.data.header.message_id != msg.message_id {
+                            tracing::warn!(
+                                "Packet ID mismatch: header {} != message {}",
+                                msg.data.header.message_id,
+                                msg.message_id
+                            );
+                        }
+
+                        let policy = get_policy();
+                        let raw_reply_data =
+                            Self::new().evaluate_request(&msg.data, &rules, &policy, &on_threat);
+
+                        let mut reply = FilterReply {
+                            status: 0,
+                            message_id: msg.message_id,
+                            data: raw_reply_data,
+                        };
+
+                        let reply_size =
+                            std::mem::size_of::<FilterReply<RawExecutionResponseMsg>>() as u32;
+                        let reply_hr = unsafe {
+                            flt_ffi::FilterReplyMessage(
+                                h_port,
+                                &mut reply as *mut _ as *mut std::ffi::c_void,
+                                reply_size,
+                            )
+                        };
+
+                        if reply_hr != flt_ffi::S_OK {
+                            tracing::warn!("FilterReplyMessage failed: 0x{:08X}", reply_hr);
+                        }
                     }
-                }
 
-                unsafe {
-                    flt_ffi::FilterClose(h_port);
+                    unsafe {
+                        flt_ffi::FilterClose(h_port);
+                    }
+                    connected.store(false, Ordering::Release);
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                 }
-                connected.store(false, Ordering::Release);
             });
         }
         #[cfg(not(target_os = "windows"))]

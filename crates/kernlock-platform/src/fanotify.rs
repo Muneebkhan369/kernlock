@@ -2,6 +2,16 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FanotifyMonitorHealth {
+    Uninitialized,
+    Initialized,
+    Running,
+    Degraded,
+    Failed,
+    Stopped,
+}
+
 #[cfg(target_os = "linux")]
 use {
     chrono::Utc,
@@ -29,10 +39,18 @@ pub struct FanotifyProbeDetails {
     pub unmonitored_mounts: Vec<String>,
 }
 
+#[cfg(target_os = "linux")]
+static GLOBAL_FANOTIFY_HEALTH: std::sync::RwLock<FanotifyMonitorHealth> =
+    std::sync::RwLock::new(FanotifyMonitorHealth::Uninitialized);
+#[cfg(target_os = "linux")]
+static GLOBAL_FANOTIFY_REASON: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
 #[derive(Clone)]
 pub struct FanotifyPermissionMonitor {
     #[cfg(target_os = "linux")]
     fanotify_fd: i32,
+    health: Arc<RwLock<FanotifyMonitorHealth>>,
+    health_reason: Arc<RwLock<Option<String>>>,
     is_running: Arc<AtomicBool>,
     exec_blocking_supported: Arc<AtomicBool>,
     monitored_mounts: Arc<RwLock<Vec<String>>>,
@@ -46,6 +64,57 @@ impl FanotifyPermissionMonitor {
 
     pub fn is_exec_blocking_available() -> bool {
         Self::probe_support().exec_blocking_available
+    }
+
+    pub fn health(&self) -> FanotifyMonitorHealth {
+        self.health
+            .read()
+            .map(|h| *h)
+            .unwrap_or(FanotifyMonitorHealth::Failed)
+    }
+
+    pub fn health_reason(&self) -> Option<String> {
+        self.health_reason
+            .read()
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_health(&self, health: FanotifyMonitorHealth, reason: Option<String>) {
+        if let Ok(mut h) = self.health.write() {
+            *h = health;
+        }
+        if let Ok(mut r) = self.health_reason.write() {
+            *r = reason.clone();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(mut gh) = GLOBAL_FANOTIFY_HEALTH.write() {
+                *gh = health;
+            }
+            if let Ok(mut gr) = GLOBAL_FANOTIFY_REASON.write() {
+                *gr = reason;
+            }
+        }
+    }
+
+    pub fn global_health() -> (FanotifyMonitorHealth, Option<String>) {
+        #[cfg(target_os = "linux")]
+        {
+            let h = GLOBAL_FANOTIFY_HEALTH
+                .read()
+                .map(|g| *g)
+                .unwrap_or(FanotifyMonitorHealth::Uninitialized);
+            let r = GLOBAL_FANOTIFY_REASON
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            (h, r)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            (FanotifyMonitorHealth::Uninitialized, None)
+        }
     }
 
     pub fn probe_support() -> FanotifyProbeDetails {
@@ -265,13 +334,17 @@ impl FanotifyPermissionMonitor {
             "Fanotify kernel execution blocking monitor initialized (fd: {}, exec_blocking: {})",
             fd, exec_supported
         );
-        Ok(Self {
+        let monitor = Self {
             fanotify_fd: fd,
+            health: Arc::new(RwLock::new(FanotifyMonitorHealth::Initialized)),
+            health_reason: Arc::new(RwLock::new(None)),
             is_running: Arc::new(AtomicBool::new(false)),
             exec_blocking_supported: Arc::new(AtomicBool::new(exec_supported)),
             monitored_mounts: Arc::new(RwLock::new(monitored)),
             unmonitored_mounts: Arc::new(RwLock::new(unmonitored)),
-        })
+        };
+        monitor.set_health(FanotifyMonitorHealth::Initialized, None);
+        Ok(monitor)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -302,6 +375,59 @@ impl FanotifyPermissionMonitor {
     }
 
     #[cfg(target_os = "linux")]
+    pub fn send_response_with_retry(
+        fanotify_fd: i32,
+        event_fd: i32,
+        decision: u32,
+    ) -> Result<(), std::io::Error> {
+        let response = libc::fanotify_response {
+            fd: event_fd,
+            response: decision,
+        };
+
+        let mut retries = 0;
+        const MAX_RETRIES: usize = 5;
+
+        while retries < MAX_RETRIES {
+            let res = unsafe {
+                libc::write(
+                    fanotify_fd,
+                    &response as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::fanotify_response>(),
+                )
+            };
+
+            if res >= 0 {
+                return Ok(());
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                // Interrupted by signal; retry immediately
+                continue;
+            }
+
+            if err.raw_os_error() == Some(libc::EAGAIN) {
+                // Backoff and retry
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(2 * (retries as u64)));
+                continue;
+            }
+
+            // Fatal write error
+            return Err(err);
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "Exceeded {} retries writing fanotify permission response",
+                MAX_RETRIES
+            ),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn start<F>(
         &self,
         vault_dir: PathBuf,
@@ -314,7 +440,9 @@ impl FanotifyPermissionMonitor {
         if self.is_running.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.set_health(FanotifyMonitorHealth::Running, None);
 
+        let self_monitor = self.clone();
         let is_running = self.is_running.clone();
         let fanotify_fd = self.fanotify_fd;
         let self_pid = std::process::id() as i32;
@@ -331,8 +459,35 @@ impl FanotifyPermissionMonitor {
                 };
 
                 let poll_res = unsafe { libc::poll(&mut pfd, 1, 50) };
-                if poll_res <= 0 {
+                if poll_res < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    error!("Fatal fanotify poll error on fd {}: {}", fanotify_fd, err);
+                    self_monitor.set_health(
+                        FanotifyMonitorHealth::Failed,
+                        Some(format!("Fatal poll error: {}", err)),
+                    );
+                    is_running.store(false, Ordering::SeqCst);
+                    break;
+                }
+
+                if poll_res == 0 {
                     continue;
+                }
+
+                if (pfd.revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP)) != 0 {
+                    error!(
+                        "fanotify fd {} error poll flags: {:#x}",
+                        fanotify_fd, pfd.revents
+                    );
+                    self_monitor.set_health(
+                        FanotifyMonitorHealth::Failed,
+                        Some(format!("Poll returned error flags: {:#x}", pfd.revents)),
+                    );
+                    is_running.store(false, Ordering::SeqCst);
+                    break;
                 }
 
                 if (pfd.revents & libc::POLLIN) == 0 {
@@ -354,8 +509,23 @@ impl FanotifyPermissionMonitor {
                     {
                         continue;
                     }
-                    warn!("fanotify event read error: {}", err);
-                    continue;
+                    error!("Fatal fanotify event read error: {}", err);
+                    self_monitor.set_health(
+                        FanotifyMonitorHealth::Failed,
+                        Some(format!("Fatal read error: {}", err)),
+                    );
+                    is_running.store(false, Ordering::SeqCst);
+                    break;
+                }
+
+                if n == 0 {
+                    info!("fanotify fd was closed (EOF on read)");
+                    self_monitor.set_health(
+                        FanotifyMonitorHealth::Stopped,
+                        Some("Fanotify file descriptor closed".to_string()),
+                    );
+                    is_running.store(false, Ordering::SeqCst);
+                    break;
                 }
 
                 let mut offset = 0;
@@ -364,10 +534,23 @@ impl FanotifyPermissionMonitor {
                         &*(buf[offset..].as_ptr() as *const libc::fanotify_event_metadata)
                     };
 
-                    // Handle event queue overflow
+                    // Handle event queue overflow safely without discarding subsequent buffer events
                     if (metadata.mask & libc::FAN_Q_OVERFLOW) != 0 {
                         warn!("fanotify kernel event queue overflowed: some events were dropped");
-                        break;
+                        self_monitor.set_health(
+                            FanotifyMonitorHealth::Degraded,
+                            Some(
+                                "Kernel event queue overflowed: some events were dropped"
+                                    .to_string(),
+                            ),
+                        );
+                        let ev_len = metadata.event_len as usize;
+                        if ev_len >= std::mem::size_of::<libc::fanotify_event_metadata>() {
+                            offset += ev_len;
+                        } else {
+                            offset += std::mem::size_of::<libc::fanotify_event_metadata>();
+                        }
+                        continue;
                     }
 
                     if metadata.event_len
@@ -388,26 +571,26 @@ impl FanotifyPermissionMonitor {
                             &on_threat,
                         );
 
-                        let response = libc::fanotify_response {
-                            fd: event_fd,
-                            response: decision,
-                        };
-
-                        let write_res = unsafe {
-                            libc::write(
-                                fanotify_fd,
-                                &response as *const _ as *const libc::c_void,
-                                std::mem::size_of::<libc::fanotify_response>(),
-                            )
-                        };
-
-                        if write_res < 0 {
+                        // Deliberate permission-response write recovery policy
+                        let send_res =
+                            Self::send_response_with_retry(fanotify_fd, event_fd, decision);
+                        if let Err(e) = send_res {
                             error!(
-                                "Failed to send fanotify permission response for fd {} (decision: {}): {}",
-                                event_fd,
-                                decision,
-                                std::io::Error::last_os_error()
+                                "Fatal error sending fanotify permission response for fd {} (decision {}): {}. Transitioning to Failed state.",
+                                event_fd, decision, e
                             );
+                            self_monitor.set_health(
+                                FanotifyMonitorHealth::Failed,
+                                Some(format!(
+                                    "Failed to write permission response for event fd {}: {}",
+                                    event_fd, e
+                                )),
+                            );
+                            is_running.store(false, Ordering::SeqCst);
+                            unsafe {
+                                libc::close(event_fd);
+                            }
+                            break;
                         }
 
                         unsafe {
@@ -571,6 +754,7 @@ impl FanotifyPermissionMonitor {
 
     pub fn stop(&self) {
         if self.is_running.swap(false, Ordering::SeqCst) {
+            self.set_health(FanotifyMonitorHealth::Stopped, None);
             #[cfg(target_os = "linux")]
             unsafe {
                 libc::close(self.fanotify_fd);

@@ -18,7 +18,6 @@
 #include <bsm/libbsm.h>
 
 #define KERNLOCK_DAEMON_SOCKET_PATH "/var/run/kernlock/kernlock.sock"
-#define FALLBACK_SOCKET_PATH       "/tmp/kernlock.sock"
 
 // Operational mode (can be updated via daemon IPC)
 typedef enum {
@@ -70,14 +69,8 @@ static int query_daemon_verdict(const char *path, pid_t pid, pid_t ppid, int is_
     strncpy(addr.sun_path, KERNLOCK_DAEMON_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        // Try fallback socket path in /tmp
-        memset(&addr, 0, sizeof(addr));
-        addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, FALLBACK_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            close(sock);
-            return -1;
-        }
+        close(sock);
+        return -1;
     }
 
     // Format query JSON

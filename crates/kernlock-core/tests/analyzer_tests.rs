@@ -188,3 +188,44 @@ fn detects_pe_packer_and_wx_section() {
         .iter()
         .any(|m| m.rule_id == "KL-PE-PACKER-SECTION"));
 }
+
+#[test]
+fn streaming_scanner_detects_signature_crossing_chunk_boundary() {
+    let rules = RuleEngine::builtin();
+    let policy = PolicyConfig::default();
+
+    let eicar_bytes = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+
+    // Chunk size in scan_stream_reader is 64KB (65536 bytes).
+    // Position signature so it starts 20 bytes BEFORE the 64KB boundary and crosses into chunk 2.
+    let boundary_offset = 64 * 1024 - 20;
+    let mut file_data = vec![0x90u8; 128 * 1024]; // 128KB total
+    file_data[boundary_offset..boundary_offset + eicar_bytes.len()].copy_from_slice(eicar_bytes);
+
+    let mut cursor = std::io::Cursor::new(file_data);
+    let res = kernlock_core::scan_stream_reader(&mut cursor, "boundary_test.bin", &rules, &policy)
+        .unwrap();
+
+    assert!(res.is_suspicious);
+    assert!(res.matches.iter().any(|m| m.rule_id == "KL-SIG-EICAR"));
+}
+
+#[test]
+fn streaming_scanner_detects_signature_deep_in_large_file_past_512kb() {
+    let rules = RuleEngine::builtin();
+    let policy = PolicyConfig::default();
+
+    let eicar_bytes = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+
+    // Position signature at 1MB (well past the 512KB static inspection buffer)
+    let deep_offset = 1024 * 1024;
+    let mut file_data = vec![0x90u8; 1536 * 1024]; // 1.5MB total
+    file_data[deep_offset..deep_offset + eicar_bytes.len()].copy_from_slice(eicar_bytes);
+
+    let mut cursor = std::io::Cursor::new(file_data);
+    let res =
+        kernlock_core::scan_stream_reader(&mut cursor, "deep_test.bin", &rules, &policy).unwrap();
+
+    assert!(res.is_suspicious);
+    assert!(res.matches.iter().any(|m| m.rule_id == "KL-SIG-EICAR"));
+}

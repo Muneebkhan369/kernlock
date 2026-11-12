@@ -155,6 +155,70 @@ impl RuleEngine {
         Ok(())
     }
 
+    pub fn max_byte_signature_len(&self) -> usize {
+        let mut max_len = 128;
+        for sig in crate::signatures::KNOWN_BYTE_SIGNATURES {
+            max_len = max_len.max(sig.pattern.len());
+        }
+        if let Ok(guard) = self.signatures.read() {
+            for (_, pat) in &guard.byte_signatures {
+                max_len = max_len.max(pat.len());
+            }
+        }
+        max_len
+    }
+
+    pub fn check_byte_signatures_window(&self, window: &[u8]) -> Vec<RuleMatch> {
+        let mut matches = Vec::new();
+
+        // 1. Built-in byte signatures
+        for sig in crate::signatures::KNOWN_BYTE_SIGNATURES {
+            if !sig.pattern.is_empty()
+                && window.windows(sig.pattern.len()).any(|w| w == sig.pattern)
+            {
+                matches.push(RuleMatch {
+                    rule_id: sig.id.to_string(),
+                    rule_name: sig.name.to_string(),
+                    severity: sig.severity,
+                    score: sig.score,
+                    category: EventCategory::File,
+                    explanation: sig.explanation.to_string(),
+                    evidence: format!("matched_pattern_bytes={}", sig.pattern.len()),
+                    remediation: sig.remediation.to_string(),
+                });
+            }
+        }
+
+        // 2. Dynamic bundle byte signatures
+        if let Ok(guard) = self.signatures.read() {
+            for (b_sig, pattern) in &guard.byte_signatures {
+                if !pattern.is_empty()
+                    && window
+                        .windows(pattern.len())
+                        .any(|w| w == pattern.as_slice())
+                {
+                    matches.push(RuleMatch {
+                        rule_id: b_sig.id.clone(),
+                        rule_name: b_sig.threat_name.clone(),
+                        severity: b_sig.severity,
+                        score: b_sig.risk_score,
+                        category: EventCategory::File,
+                        explanation: format!(
+                            "Matches byte signature pattern in threat intelligence bundle: {}",
+                            b_sig.id
+                        ),
+                        evidence: format!("pattern_hex={}", b_sig.pattern_hex),
+                        remediation:
+                            "Quarantine file immediately and inspect execution provenance."
+                                .to_string(),
+                    });
+                }
+            }
+        }
+
+        matches
+    }
+
     pub fn check_signatures(&self, bytes: &[u8], sha256: &str) -> Vec<RuleMatch> {
         let mut matches = crate::signatures::check_signatures(bytes, sha256);
 

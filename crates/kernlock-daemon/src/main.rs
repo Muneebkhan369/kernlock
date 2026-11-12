@@ -53,6 +53,22 @@ enum Commands {
         #[arg(long, default_value = "markdown")]
         format: String,
     },
+    /// Generate a fresh Ed25519 offline signing keypair
+    GenerateSigningKey {
+        #[arg(long, help = "Path to write the 32-byte hex private key")]
+        out_priv_key: PathBuf,
+        #[arg(long, help = "Path to write the 32-byte hex public key")]
+        out_pub_key: PathBuf,
+    },
+    /// Cryptographically sign a threat bundle manifest using an offline private key
+    SignBundle {
+        #[arg(long, help = "Path to raw ThreatBundleManifest JSON file")]
+        manifest: PathBuf,
+        #[arg(long, help = "Path to private key hex file")]
+        key_file: PathBuf,
+        #[arg(long, help = "Path to write the output SignedThreatBundle JSON")]
+        output: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -81,6 +97,10 @@ async fn main() -> Result<()> {
         Commands::Serve { port, ui_dir } => {
             let api_token = auth::load_or_create_token(&data_dir)?;
             engine.start_fanotify_monitor();
+            #[cfg(unix)]
+            engine.start_unix_socket_server(&data_dir);
+            #[cfg(target_os = "windows")]
+            engine.start_windows_minifilter();
             engine.start_realtime_watcher();
             let app = api::build_router(engine, api_token, ui_dir);
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -133,6 +153,71 @@ async fn main() -> Result<()> {
             } else {
                 println!("{}", engine.format_report_markdown(&report));
             }
+        }
+        Commands::GenerateSigningKey {
+            out_priv_key,
+            out_pub_key,
+        } => {
+            use ed25519_dalek::SigningKey;
+            let mut seed = [0u8; 32];
+            getrandom::getrandom(&mut seed).map_err(|e| anyhow::anyhow!("CSPRNG error: {}", e))?;
+            let signing_key = SigningKey::from_bytes(&seed);
+            let priv_hex = hex::encode(signing_key.to_bytes());
+            let pub_hex = hex::encode(signing_key.verifying_key().to_bytes());
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&out_priv_key)?;
+                use std::io::Write;
+                f.write_all(priv_hex.as_bytes())?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&out_priv_key, &priv_hex)?;
+            }
+
+            std::fs::write(&out_pub_key, &pub_hex)?;
+            println!("Successfully generated Ed25519 offline signing keypair.");
+            println!("Private Key (chmod 0600): {}", out_priv_key.display());
+            println!("Public Key: {}", out_pub_key.display());
+            println!("Public Key Hex: {}", pub_hex);
+        }
+        Commands::SignBundle {
+            manifest,
+            key_file,
+            output,
+        } => {
+            use ed25519_dalek::SigningKey;
+            use kernlock_core::intelligence::{SignedThreatBundle, ThreatBundleManifest};
+
+            let manifest_str = std::fs::read_to_string(&manifest)?;
+            let manifest_obj: ThreatBundleManifest = serde_json::from_str(&manifest_str)?;
+
+            let key_hex = std::fs::read_to_string(&key_file)?;
+            let key_bytes = hex::decode(key_hex.trim())?;
+            if key_bytes.len() != 32 {
+                anyhow::bail!("Private key must be exactly 32 bytes (64 hex characters)");
+            }
+            let mut key_arr = [0u8; 32];
+            key_arr.copy_from_slice(&key_bytes);
+            let signing_key = SigningKey::from_bytes(&key_arr);
+
+            let bundle = SignedThreatBundle::new(manifest_obj, &signing_key)
+                .map_err(|e| anyhow::anyhow!("Signing failed: {}", e))?;
+
+            let bundle_json = serde_json::to_string_pretty(&bundle)?;
+            std::fs::write(&output, bundle_json)?;
+            println!(
+                "Successfully signed threat bundle v{} -> {}",
+                bundle.manifest.version,
+                output.display()
+            );
         }
     }
 

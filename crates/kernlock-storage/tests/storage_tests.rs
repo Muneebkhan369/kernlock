@@ -204,3 +204,48 @@ fn test_threat_history_storage() {
     assert_eq!(list[0].action_taken, "Quarantined");
     assert_eq!(list[0].quarantine_id, Some(q_id));
 }
+
+#[test]
+fn test_threat_definitions_storage() {
+    use kernlock_core::intelligence::{
+        BundleByteSignature, BundleHashSignature, SignedThreatBundle, ThreatBundleManifest,
+    };
+
+    let storage = Storage::open_in_memory().expect("open memory db");
+    assert!(storage.load_threat_bundle().expect("load empty").is_none());
+
+    let manifest = ThreatBundleManifest {
+        version: "2026.11.2".to_string(),
+        timestamp: Utc::now(),
+        rules: Vec::new(),
+        hash_signatures: vec![BundleHashSignature {
+            sha256: "aabbccdd11223344".to_string(),
+            threat_name: "TestMalware".to_string(),
+            severity: Severity::Critical,
+            risk_score: 95,
+        }],
+        byte_signatures: vec![BundleByteSignature {
+            id: "KL-TEST-01".to_string(),
+            threat_name: "TestByteSig".to_string(),
+            severity: Severity::High,
+            risk_score: 80,
+            pattern_hex: "41424344".to_string(),
+        }],
+    };
+
+    let bundle = SignedThreatBundle {
+        manifest,
+        signature_hex: "01020304".repeat(16),
+        public_key_hex: Some("aa".repeat(32)),
+    };
+    storage.save_threat_bundle(&bundle).expect("save bundle");
+
+    let loaded = storage
+        .load_threat_bundle()
+        .expect("load bundle")
+        .expect("bundle exists");
+    assert_eq!(loaded.manifest.version, "2026.11.2");
+    assert_eq!(loaded.manifest.hash_signatures.len(), 1);
+    assert_eq!(loaded.manifest.byte_signatures.len(), 1);
+    assert_eq!(loaded.signature_hex, bundle.signature_hex);
+}

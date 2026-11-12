@@ -63,7 +63,10 @@ async fn test_definitions_api_lifecycle_and_tampering_rejection() {
     let bytes = status_resp.into_body().collect().await.unwrap().to_bytes();
     let initial_status: DefinitionStatus = serde_json::from_slice(&bytes).unwrap();
     assert!(initial_status.rule_count > 0);
-    assert_eq!(initial_status.version, "2026.11.1-builtin");
+    assert_eq!(
+        initial_status.version,
+        kernlock_core::BUILTIN_BASELINE_VERSION
+    );
 
     // 3. Attacker bundle signed with untrusted key must be REJECTED even if bundle includes its public key
     let attacker_manifest = ThreatBundleManifest {
@@ -233,4 +236,87 @@ async fn test_definitions_api_lifecycle_and_tampering_rejection() {
     let verified_status: DefinitionStatus = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(verified_status.version, "2026.11.12.95");
     assert_eq!(verified_status.rule_count, 1);
+
+    // 9. Restart persistence: simulate daemon restart from the same data_dir
+    drop(app);
+    drop(engine);
+
+    let engine_restarted = KernLockEngine::init(tmp.path()).unwrap();
+    let restarted_status = engine_restarted.definition_status();
+    assert_eq!(restarted_status.version, "2026.11.12.95");
+    assert_eq!(restarted_status.rule_count, 1);
+    assert_eq!(restarted_status.hash_signature_count, 1);
+    assert_eq!(restarted_status.byte_signature_count, 1);
+
+    // Dynamic signatures must still participate in scanning after restart
+    let restart_scan = engine_restarted.scan_path(&scan_fixture).unwrap();
+    assert_eq!(restart_scan.len(), 1);
+    assert!(restart_scan[0].is_suspicious);
+    assert_eq!(
+        restart_scan[0].threat_name.as_deref(),
+        Some("Trojan.LiveBytePayload")
+    );
+
+    // Anti-rollback must persist across daemon restarts
+    engine_restarted.add_trusted_key_hex(&trusted_pub_hex);
+    let rollback_after_restart_res = engine_restarted.update_definitions(rollback_bundle);
+    assert!(rollback_after_restart_res.is_err());
+}
+
+#[tokio::test]
+async fn test_concurrent_update_races_and_failed_recovery() {
+    use std::sync::Arc;
+
+    let tmp = TempDir::new().unwrap();
+    let engine = Arc::new(KernLockEngine::init(tmp.path()).unwrap());
+
+    let trusted_seed = [88u8; 32];
+    let trusted_signing_key = SigningKey::from_bytes(&trusted_seed);
+    let trusted_pub_hex = hex::encode(trusted_signing_key.verifying_key().to_bytes());
+    engine.add_trusted_key_hex(&trusted_pub_hex);
+
+    // Spawn 10 concurrent update attempts with candidate versions
+    let mut handles = Vec::new();
+    for i in 1..=10 {
+        let eng = engine.clone();
+        let key = trusted_signing_key.clone();
+        let handle = tokio::spawn(async move {
+            let manifest = ThreatBundleManifest {
+                version: format!("2026.11.12.{}", 100 + i),
+                timestamp: Utc::now() + Duration::seconds(i as i64 * 10),
+                rules: vec![],
+                hash_signatures: vec![],
+                byte_signatures: vec![],
+            };
+            let bundle = SignedThreatBundle::new(manifest, &key).unwrap();
+            eng.update_definitions(bundle)
+        });
+        handles.push(handle);
+    }
+
+    let mut success_count = 0;
+    for h in handles {
+        if let Ok(Ok(_)) = h.await {
+            success_count += 1;
+        }
+    }
+
+    // At least one must succeed and engine state must remain consistent
+    assert!(success_count >= 1);
+    let final_status = engine.definition_status();
+    assert!(final_status.version.starts_with("2026.11.12."));
+
+    // Verify recovery: even after failed update attempts, the engine remains fully operational
+    let failed_manifest = ThreatBundleManifest {
+        version: "2026.11.1".to_string(), // old version
+        timestamp: Utc::now() - Duration::days(1),
+        rules: vec![],
+        hash_signatures: vec![],
+        byte_signatures: vec![],
+    };
+    let failed_bundle = SignedThreatBundle::new(failed_manifest, &trusted_signing_key).unwrap();
+    assert!(engine.update_definitions(failed_bundle).is_err());
+
+    // Current version must be preserved intact
+    assert_eq!(engine.definition_status().version, final_status.version);
 }

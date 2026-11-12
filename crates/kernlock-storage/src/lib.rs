@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use kernlock_core::{
     AlertStatus, EventCategory, FileScanResult, PolicyConfig, QuarantineRecord, QuarantineStatus,
-    ScanJobSummary, ScanMode, ScanStatus, SecurityEvent, Severity, ThreatAlert, ThreatRecord,
+    ScanJobSummary, ScanMode, ScanStatus, SecurityEvent, Severity, SignedThreatBundle, ThreatAlert,
+    ThreatRecord,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -135,9 +136,72 @@ impl Storage {
             );
 
             CREATE INDEX IF NOT EXISTS idx_threat_history_ts ON threat_history(timestamp DESC);
+
+            CREATE TABLE IF NOT EXISTS threat_definitions (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                bundle_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS trusted_keys (
+                pubkey_hex TEXT PRIMARY KEY
+            );
             ",
         )?;
         Ok(())
+    }
+
+    pub fn add_trusted_key(&self, pubkey_hex: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO trusted_keys (pubkey_hex) VALUES (?1)",
+            params![pubkey_hex.trim().to_lowercase()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_trusted_keys(&self) -> Result<Vec<String>, StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        let mut stmt = conn.prepare("SELECT pubkey_hex FROM trusted_keys")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut keys = Vec::new();
+        for r in rows {
+            keys.push(r?);
+        }
+        Ok(keys)
+    }
+
+    pub fn save_threat_bundle(&self, bundle: &SignedThreatBundle) -> Result<(), StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        let json = serde_json::to_string(bundle)?;
+        conn.execute(
+            "INSERT INTO threat_definitions (id, version, updated_at, bundle_json)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                version = excluded.version,
+                updated_at = excluded.updated_at,
+                bundle_json = excluded.bundle_json",
+            params![
+                bundle.manifest.version,
+                bundle.manifest.timestamp.to_rfc3339(),
+                json
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_threat_bundle(&self) -> Result<Option<SignedThreatBundle>, StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        let mut stmt = conn.prepare("SELECT bundle_json FROM threat_definitions WHERE id = 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let json: String = row.get(0)?;
+            let bundle: SignedThreatBundle = serde_json::from_str(&json)?;
+            Ok(Some(bundle))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn insert_event(&self, event: &SecurityEvent) -> Result<(), StorageError> {

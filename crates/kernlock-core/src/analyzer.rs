@@ -225,25 +225,46 @@ pub fn scan_stream_reader<R: Read>(
     let mut read_buf = [0u8; 64 * 1024];
     let mut total_bytes = 0u64;
 
+    // Bounded-memory streaming pattern matching across chunk boundaries throughout the file
+    let max_sig_len = rules.max_byte_signature_len().max(256);
+    let mut overlap_buf: Vec<u8> = Vec::with_capacity(max_sig_len + 64 * 1024);
+    let mut streaming_matches: Vec<RuleMatch> = Vec::new();
+    let mut seen_rule_ids = std::collections::HashSet::new();
+
     loop {
         let n = reader.read(&mut read_buf)?;
         if n == 0 {
             break;
         }
         total_bytes += n as u64;
-        hasher.update(&read_buf[..n]);
+        let chunk = &read_buf[..n];
+        hasher.update(chunk);
 
         if inspect_buf.len() < DEFAULT_MAX_INSPECT_BYTES {
             let needed = (DEFAULT_MAX_INSPECT_BYTES - inspect_buf.len()).min(n);
-            inspect_buf.extend_from_slice(&read_buf[..needed]);
+            inspect_buf.extend_from_slice(&chunk[..needed]);
         }
+
+        // Extend overlap buffer with current chunk and check signatures across boundaries
+        overlap_buf.extend_from_slice(chunk);
+        let window_matches = rules.check_byte_signatures_window(&overlap_buf);
+        for m in window_matches {
+            if seen_rule_ids.insert(m.rule_id.clone()) {
+                streaming_matches.push(m);
+            }
+        }
+
+        // Retain only trailing (max_sig_len - 1) bytes for the next boundary
+        let keep_len = (max_sig_len.saturating_sub(1)).min(overlap_buf.len());
+        let tail_start = overlap_buf.len() - keep_len;
+        overlap_buf.drain(..tail_start);
     }
 
     let sha256 = hex::encode(hasher.finalize());
     let file_type = detect_file_type(path_hint, &inspect_buf);
     let entropy = shannon_entropy(&inspect_buf);
 
-    evaluate_scan_details(
+    let mut result = evaluate_scan_details(
         path_hint,
         sha256,
         total_bytes,
@@ -252,7 +273,34 @@ pub fn scan_stream_reader<R: Read>(
         &inspect_buf,
         rules,
         policy,
-    )
+    )?;
+
+    // Integrate matches discovered anywhere throughout the stream (including past 512KB and chunk boundaries)
+    for m in streaming_matches {
+        if !result
+            .matches
+            .iter()
+            .any(|existing| existing.rule_id == m.rule_id)
+        {
+            result.matches.push(m);
+        }
+    }
+
+    if !result.matches.is_empty() {
+        let score = aggregate_score(&result.matches);
+        result.risk_score = score.max(result.risk_score);
+        let severity = severity_from_score(result.risk_score);
+        if severity > result.severity {
+            result.severity = severity;
+        }
+        if result.threat_name.is_none() {
+            result.threat_name = result.matches.first().map(|m| m.rule_name.clone());
+        }
+        result.is_suspicious =
+            result.risk_score >= policy.auto_quarantine_threshold || !result.matches.is_empty();
+    }
+
+    Ok(result)
 }
 
 #[cfg(unix)]
@@ -269,8 +317,13 @@ pub fn scan_file_from_fd(
         return Err(io::Error::last_os_error());
     }
 
-    // Rewind file descriptor offset to the start of the file
-    unsafe { libc::lseek(dup_fd, 0, libc::SEEK_SET) };
+    // Rewind file descriptor offset to the start of the file and check for lseek error
+    let seek_res = unsafe { libc::lseek(dup_fd, 0, libc::SEEK_SET) };
+    if seek_res < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(dup_fd) };
+        return Err(err);
+    }
 
     let mut file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
     scan_stream_reader(&mut file, path_hint, rules, policy)

@@ -56,6 +56,8 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
             || Path::new("/usr/sbin/auditd").exists()
             || Path::new("/run/auditd.pid").exists();
 
+        let (monitor_health, monitor_reason) =
+            crate::fanotify::FanotifyPermissionMonitor::global_health();
         let fanotify_probe = crate::fanotify::FanotifyPermissionMonitor::probe_support();
         let inotify_supported = Path::new("/proc/sys/fs/inotify/max_user_watches").exists();
 
@@ -65,9 +67,7 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
         let (active_mode, fallback_reason) = match requested_mode {
             SecurityMode::Audit => (SecurityMode::Audit, None),
             SecurityMode::Protection | SecurityMode::Strict => {
-                if kernel_blocking_available {
-                    (requested_mode, None)
-                } else {
+                if !kernel_blocking_available {
                     (
                         requested_mode,
                         Some(format!(
@@ -76,6 +76,68 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
                             requested_mode
                         )),
                     )
+                } else if monitor_health != crate::fanotify::FanotifyMonitorHealth::Running {
+                    (
+                        requested_mode,
+                        Some(format!(
+                            "Kernel execution blocking is supported by kernel but monitor is currently {:?}. Post-write detection and automatic quarantine are operational.",
+                            monitor_health
+                        )),
+                    )
+                } else {
+                    (requested_mode, None)
+                }
+            }
+        };
+
+        let fanotify_active_str = match monitor_health {
+            crate::fanotify::FanotifyMonitorHealth::Running => {
+                if fanotify_probe.exec_blocking_available {
+                    match requested_mode {
+                        SecurityMode::Audit => {
+                            "Standby (Audit mode active, observing permissions)".to_string()
+                        }
+                        SecurityMode::Protection => {
+                            "Active (FAN_OPEN_EXEC_PERM execution blocking)".to_string()
+                        }
+                        SecurityMode::Strict => {
+                            "Active (Strict execution blocking, fail-closed)".to_string()
+                        }
+                    }
+                } else {
+                    "Degraded (FAN_OPEN_PERM only; execution blocking unavailable)".to_string()
+                }
+            }
+            crate::fanotify::FanotifyMonitorHealth::Degraded => format!(
+                "Degraded ({})",
+                monitor_reason
+                    .as_deref()
+                    .unwrap_or("Event queue overflow or degraded kernel state")
+            ),
+            crate::fanotify::FanotifyMonitorHealth::Failed => format!(
+                "Failed ({})",
+                monitor_reason
+                    .as_deref()
+                    .unwrap_or("Fatal error in permission event loop")
+            ),
+            crate::fanotify::FanotifyMonitorHealth::Stopped => {
+                "Stopped (Kernel permission monitor is stopped)".to_string()
+            }
+            crate::fanotify::FanotifyMonitorHealth::Initialized => {
+                "Standby (Monitor initialized; waiting for event loop startup)".to_string()
+            }
+            crate::fanotify::FanotifyMonitorHealth::Uninitialized => {
+                if fanotify_probe.supported {
+                    format!(
+                        "Standby (Kernel support detected{}; monitor not started)",
+                        if fanotify_probe.exec_blocking_available {
+                            ", exec blocking available"
+                        } else {
+                            ", open perm only"
+                        }
+                    )
+                } else {
+                    format!("Unavailable ({})", fanotify_probe.details)
                 }
             }
         };
@@ -109,23 +171,14 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
                 name: "Pre-Execution / Access Blocking (fanotify)".to_string(),
                 supported: fanotify_probe.supported,
                 enforcement_available: fanotify_probe.exec_blocking_available,
-                active_mode: if fanotify_probe.exec_blocking_available {
-                    match requested_mode {
-                        SecurityMode::Audit => "Standby (Audit mode active)".to_string(),
-                        SecurityMode::Protection => {
-                            "Active (FAN_OPEN_EXEC_PERM execution blocking)".to_string()
-                        }
-                        SecurityMode::Strict => {
-                            "Active (Strict execution blocking, fail-closed)".to_string()
-                        }
-                    }
-                } else if fanotify_probe.supported {
-                    "Degraded (FAN_OPEN_PERM only; execution blocking unavailable)".to_string()
-                } else {
-                    format!("Unavailable ({})", fanotify_probe.details)
-                },
+                active_mode: fanotify_active_str,
                 details: format!(
-                    "Kernel execution blocking. Monitored mounts: {}. Unmonitored mounts: {}. Status: {}",
+                    "Kernel execution blocking (health: {:?}{}). Monitored mounts: {}. Unmonitored mounts: {}. Status: {}",
+                    monitor_health,
+                    monitor_reason
+                        .as_ref()
+                        .map(|r| format!(" - {}", r))
+                        .unwrap_or_default(),
                     if fanotify_probe.monitored_mounts.is_empty() {
                         "None".to_string()
                     } else {

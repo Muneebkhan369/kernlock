@@ -1,6 +1,17 @@
 /**
  * KernLock Security - Windows Filesystem Minifilter Driver (FLTMGR)
  * Implementation: Pre-operation execution interception and user-mode verdict communication.
+ *
+ * Compilation with Windows Driver Kit (WDK):
+ *   1. Install Windows Driver Kit (WDK) 10/11 and Visual Studio Build Tools.
+ *   2. Build driver using MSBuild:
+ *      msbuild kernlock_filter.vcxproj /p:Configuration=Release /p:Platform=x64
+ *   3. Driver Altitude:
+ *      Altitude 325000 belongs to the Microsoft Filter Manager load order band
+ *      "FSFilter Anti-Virus" (320000 - 329999).
+ *      For testing: bcdedit /set testsigning on, then sign with a test certificate.
+ *      For production: request assigned altitude from Microsoft (fsfilt@microsoft.com)
+ *      and sign via Microsoft Partner Center WHQL attestation.
  */
 
 #include <fltKernel.h>
@@ -15,10 +26,35 @@ PFLT_PORT g_ServerPort = NULL;
 PFLT_PORT g_ClientPort = NULL;
 static volatile LONG g_MessageCounter = 0;
 
+// Forward declarations
+FLT_PREOP_CALLBACK_STATUS
+KernLockPreCreate (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    );
+
+FLT_PREOP_CALLBACK_STATUS
+KernLockPreAcquireForSectionSynchronization (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    );
+
+NTSTATUS
+KernLockFilterUnload (
+    _In_ FLT_FILTER_UNLOAD_FLAGS Flags
+    );
+
 CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
     { IRP_MJ_CREATE,
       0,
       KernLockPreCreate,
+      NULL },
+
+    { IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION,
+      0,
+      KernLockPreAcquireForSectionSynchronization,
       NULL },
 
     { IRP_MJ_OPERATION_END }
@@ -135,16 +171,108 @@ KernLockPreCreate (
                             &replyLength,
                             &timeout);
 
-    if (NT_SUCCESS(status)) {
-        if (responseMsg.Verdict == VerdictBlock) {
-            // Block execution attempt with ACCESS_DENIED
-            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-            Data->IoStatus.Information = 0;
-            return FLT_PREOP_COMPLETE;
+    // CRITICAL: STATUS_TIMEOUT (0x00000102) is a success-class NTSTATUS (>= 0).
+    // Testing with NT_SUCCESS(status) would evaluate to TRUE on timeout, reading
+    // uninitialized responseMsg memory! We must explicitly check status == STATUS_SUCCESS.
+    if (status == STATUS_SUCCESS) {
+        if (replyLength >= sizeof(EXECUTION_RESPONSE_MSG) &&
+            responseMsg.MessageId == requestMsg.Header.MessageId) {
+            if (responseMsg.Verdict == VerdictBlock) {
+                // Block execution attempt with ACCESS_DENIED
+                Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                Data->IoStatus.Information = 0;
+                return FLT_PREOP_COMPLETE;
+            }
         }
+    } else if (status == STATUS_TIMEOUT) {
+        // Explicit timeout handling: fail-open by default to avoid freezing system processes
     }
 
     // Default to allow on timeout or clean verdict
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+FLT_PREOP_CALLBACK_STATUS
+KernLockPreAcquireForSectionSynchronization (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    )
+{
+    NTSTATUS status;
+    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+    EXECUTION_REQUEST_MSG requestMsg;
+    EXECUTION_RESPONSE_MSG responseMsg;
+    ULONG replyLength = sizeof(EXECUTION_RESPONSE_MSG);
+    LARGE_INTEGER timeout;
+
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    // Only intercept user-mode requests
+    if (Data->RequestorMode != UserMode) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    // Intercept section creation for executable mapping (SyncTypeCreateSection)
+    if (Data->Iopb->Parameters.AcquireForSectionSynchronization.SyncType != SyncTypeCreateSection) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    // Verify if executable memory protection was requested
+    ULONG pageProtection = Data->Iopb->Parameters.AcquireForSectionSynchronization.PageProtection;
+    if (!(pageProtection & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    // If no client (daemon) is connected to our communication port, allow (fail-open)
+    if (g_ClientPort == NULL) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    status = FltGetFileNameInformation(Data,
+                                       FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+                                       &nameInfo);
+    if (!NT_SUCCESS(status)) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    FltParseFileNameInformation(nameInfo);
+
+    RtlZeroMemory(&requestMsg, sizeof(EXECUTION_REQUEST_MSG));
+    requestMsg.Header.MessageId = (unsigned __int64)InterlockedIncrement(&g_MessageCounter);
+    requestMsg.Header.ProcessId = (unsigned long)(ULONG_PTR)PsGetCurrentProcessId();
+    requestMsg.Header.ThreadId = (unsigned long)(ULONG_PTR)PsGetCurrentThreadId();
+    requestMsg.DesiredAccess = pageProtection;
+
+    if (nameInfo->Name.Length < sizeof(requestMsg.FilePath)) {
+        RtlCopyMemory(requestMsg.FilePath, nameInfo->Name.Buffer, nameInfo->Name.Length);
+    }
+    FltReleaseFileNameInformation(nameInfo);
+
+    // 500ms timeout for verdict evaluation
+    timeout.QuadPart = -5000000; // 500ms in 100ns units
+
+    status = FltSendMessage(g_FilterHandle,
+                            &g_ClientPort,
+                            &requestMsg,
+                            sizeof(EXECUTION_REQUEST_MSG),
+                            &responseMsg,
+                            &replyLength,
+                            &timeout);
+
+    if (status == STATUS_SUCCESS) {
+        if (replyLength >= sizeof(EXECUTION_RESPONSE_MSG) &&
+            responseMsg.MessageId == requestMsg.Header.MessageId) {
+            if (responseMsg.Verdict == VerdictBlock) {
+                // Block executable section creation with ACCESS_DENIED
+                Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                Data->IoStatus.Information = 0;
+                return FLT_PREOP_COMPLETE;
+            }
+        }
+    }
+
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 

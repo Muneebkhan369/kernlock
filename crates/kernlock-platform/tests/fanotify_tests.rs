@@ -126,3 +126,97 @@ fn test_fanotify_event_evaluation_via_fd_direct_scanning_and_race_safety() {
         assert_eq!(threat_counter.load(Ordering::SeqCst), 1);
     }
 }
+
+#[test]
+fn test_fanotify_evaluate_error_fail_closed_in_strict_fail_open_in_protection() {
+    #[cfg(target_os = "linux")]
+    {
+        let tmp = TempDir::new().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        let rules = RuleEngine::builtin();
+        let on_threat =
+            |_event: kernlock_core::SecurityEvent, _alert: kernlock_core::ThreatAlert| {};
+
+        // Invalid fd 99999 simulates an unreadable or closed file descriptor error
+        let invalid_fd = 99999;
+
+        // In Strict mode: fail-closed (libc::FAN_DENY)
+        let strict_policy = PolicyConfig {
+            mode: SecurityMode::Strict,
+            ..Default::default()
+        };
+        let res_strict = FanotifyPermissionMonitor::evaluate_event(
+            invalid_fd,
+            1111,
+            2222,
+            FAN_OPEN_EXEC_PERM,
+            &vault_dir,
+            &strict_policy,
+            &rules,
+            &on_threat,
+        );
+        assert_eq!(
+            res_strict,
+            libc::FAN_DENY,
+            "Strict mode must fail-closed (FAN_DENY) on scan failure"
+        );
+
+        // In Protection mode: fail-open (libc::FAN_ALLOW)
+        let protection_policy = PolicyConfig {
+            mode: SecurityMode::Protection,
+            ..Default::default()
+        };
+        let res_protection = FanotifyPermissionMonitor::evaluate_event(
+            invalid_fd,
+            1111,
+            2222,
+            FAN_OPEN_EXEC_PERM,
+            &vault_dir,
+            &protection_policy,
+            &rules,
+            &on_threat,
+        );
+        assert_eq!(
+            res_protection,
+            libc::FAN_ALLOW,
+            "Protection mode must fail-open (FAN_ALLOW) on scan failure"
+        );
+    }
+}
+
+#[test]
+fn test_fanotify_response_retry_bounded() {
+    #[cfg(target_os = "linux")]
+    {
+        // An invalid fanotify_fd (-1) should fail immediately without infinite loop
+        let res = FanotifyPermissionMonitor::send_response_with_retry(-1, 0, libc::FAN_ALLOW);
+        assert!(res.is_err());
+    }
+}
+
+#[test]
+fn test_fanotify_health_state_transitions() {
+    use kernlock_platform::fanotify::FanotifyMonitorHealth;
+
+    let (initial_health, _) = FanotifyPermissionMonitor::global_health();
+    // Default should be Uninitialized (or Initialized if earlier tests ran)
+    assert!(
+        initial_health == FanotifyMonitorHealth::Uninitialized
+            || initial_health == FanotifyMonitorHealth::Initialized
+    );
+
+    let provider = LinuxSecurityProvider::new();
+
+    // Probe when not running reports Standby or Unavailable, never Active
+    let caps = provider.probe_capabilities(SecurityMode::Protection);
+    let fanotify_cap = caps
+        .capabilities
+        .iter()
+        .find(|c| c.name.contains("fanotify"))
+        .expect("fanotify capability entry must exist");
+    assert!(
+        !fanotify_cap.active_mode.starts_with("Active"),
+        "Capability reporting must never claim Active when monitor is not running (got: {})",
+        fanotify_cap.active_mode
+    );
+}

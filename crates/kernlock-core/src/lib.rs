@@ -11,8 +11,9 @@ pub use analyzer::{
     scan_file_streaming, scan_stream_reader, sha256_hex, shannon_entropy,
 };
 pub use intelligence::{
-    parse_version_tuple, validate_version_advance, BundleByteSignature, BundleHashSignature,
-    DefinitionStatus, IntelligenceError, SignedThreatBundle, ThreatBundleManifest,
+    builtin_baseline_timestamp, parse_version_tuple, validate_version_advance, BundleByteSignature,
+    BundleHashSignature, DefinitionStatus, IntelligenceError, SignedThreatBundle,
+    ThreatBundleManifest, BUILTIN_BASELINE_TIMESTAMP_UNIX, BUILTIN_BASELINE_VERSION,
     OFFICIAL_PUBLIC_KEY_HEX,
 };
 pub use models::*;

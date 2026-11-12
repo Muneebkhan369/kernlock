@@ -1,0 +1,53 @@
+name: KernLock CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-and-verify:
+    name: Test, Lint and Package Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace --verbose
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Verify desktop sidecar and build frontend
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run test:sidecar
+          npm run build
+
+      - name: Test Debian package generation
+        run: |
+          chmod +x scripts/package-deb.sh
+          ./scripts/package-deb.sh
+          ls -lh target/debian/*.deb
