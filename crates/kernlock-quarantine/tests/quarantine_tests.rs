@@ -3,6 +3,8 @@ use kernlock_quarantine::{FailureInjection, QuarantineError, QuarantineManager};
 use kernlock_storage::Storage;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use tempfile::TempDir;
 
 #[test]
@@ -391,11 +393,24 @@ fn delete_permanently_uses_recoverable_deleting_state_and_rolls_back() {
         }
         other => panic!("Expected RollbackFailed, got {other:?}"),
     }
-    // Record is in Deleting state with staged file on disk — verify delete_permanently recovers & completes
+    // Record is in Deleting state with staged file on disk
     assert_eq!(
         storage.get_quarantine(rec.id).unwrap().status,
         QuarantineStatus::Deleting
     );
+    // Direct call to delete_permanently fails closed with InvalidState
+    assert!(matches!(
+        qm.delete_permanently(rec.id).unwrap_err(),
+        QuarantineError::InvalidState(_)
+    ));
+    // Dedicated startup recovery inspects and restores to Quarantined
+    let report = qm.recover_on_startup().unwrap();
+    assert!(report.recovered_to_quarantine.contains(&rec.id));
+    assert_eq!(
+        storage.get_quarantine(rec.id).unwrap().status,
+        QuarantineStatus::Quarantined
+    );
+    // Now delete_permanently completes cleanly
     qm.delete_permanently(rec.id).unwrap();
     assert_eq!(
         storage.get_quarantine(rec.id).unwrap().status,
@@ -769,4 +784,161 @@ fn startup_recovery_handles_interrupted_restore() {
     assert!(second_report.finalized_restores.is_empty());
     assert!(second_report.recovered_to_quarantine.is_empty());
     assert!(second_report.recovery_failures.is_empty());
+}
+
+#[test]
+fn concurrent_two_delete_requests_only_one_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = Arc::new(QuarantineManager::new(&vault_dir, storage.clone()).unwrap());
+
+    let target = tmp.path().join("concurrent_del.bin");
+    fs::write(&target, b"delete concurrency test").unwrap();
+    let rec = qm.quarantine_file(&target, "threat").unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let qm1 = Arc::clone(&qm);
+    let barrier1 = Arc::clone(&barrier);
+    let id = rec.id;
+    let handle1 = thread::spawn(move || {
+        barrier1.wait();
+        qm1.delete_permanently(id)
+    });
+
+    let qm2 = Arc::clone(&qm);
+    let barrier2 = Arc::clone(&barrier);
+    let handle2 = thread::spawn(move || {
+        barrier2.wait();
+        qm2.delete_permanently(id)
+    });
+
+    let res1 = handle1.join().unwrap();
+    let res2 = handle2.join().unwrap();
+
+    let (ok_count, invalid_count) = match (&res1, &res2) {
+        (Ok(()), Err(QuarantineError::InvalidState(_))) => (1, 1),
+        (Err(QuarantineError::InvalidState(_)), Ok(())) => (1, 1),
+        _ => panic!(
+            "Expected exactly one Ok and one InvalidState, got res1: {res1:?}, res2: {res2:?}"
+        ),
+    };
+    assert_eq!(ok_count, 1);
+    assert_eq!(invalid_count, 1);
+    assert_eq!(
+        storage.get_quarantine(id).unwrap().status,
+        QuarantineStatus::Deleted
+    );
+    assert!(!Path::new(&rec.vault_path).exists());
+}
+
+#[test]
+fn concurrent_two_restore_requests_only_one_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = Arc::new(QuarantineManager::new(&vault_dir, storage.clone()).unwrap());
+
+    let target = tmp.path().join("concurrent_restore.bin");
+    fs::write(&target, b"restore concurrency test").unwrap();
+    let rec = qm.quarantine_file(&target, "threat").unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let qm1 = Arc::clone(&qm);
+    let barrier1 = Arc::clone(&barrier);
+    let id = rec.id;
+    let handle1 = thread::spawn(move || {
+        barrier1.wait();
+        qm1.restore_file(id)
+    });
+
+    let qm2 = Arc::clone(&qm);
+    let barrier2 = Arc::clone(&barrier);
+    let handle2 = thread::spawn(move || {
+        barrier2.wait();
+        qm2.restore_file(id)
+    });
+
+    let res1 = handle1.join().unwrap();
+    let res2 = handle2.join().unwrap();
+
+    let (ok_count, invalid_count) = match (&res1, &res2) {
+        (Ok(_), Err(QuarantineError::InvalidState(_))) => (1, 1),
+        (Err(QuarantineError::InvalidState(_)), Ok(_)) => (1, 1),
+        _ => panic!(
+            "Expected exactly one Ok and one InvalidState, got res1: {res1:?}, res2: {res2:?}"
+        ),
+    };
+    assert_eq!(ok_count, 1);
+    assert_eq!(invalid_count, 1);
+    assert_eq!(
+        storage.get_quarantine(id).unwrap().status,
+        QuarantineStatus::Restored
+    );
+    assert!(target.exists());
+    assert!(!Path::new(&rec.vault_path).exists());
+}
+
+#[test]
+fn second_delete_request_after_deleting_acquired_fails_closed() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("deleting_acquired.bin");
+    fs::write(&target, b"fail closed test").unwrap();
+    let rec = qm.quarantine_file(&target, "threat").unwrap();
+
+    // Mark record as Deleting in storage (simulating first worker having acquired the lock)
+    storage
+        .update_quarantine_status(rec.id, QuarantineStatus::Deleting, None)
+        .unwrap();
+
+    // Second delete request arrives while record is in Deleting
+    let err = qm.delete_permanently(rec.id).unwrap_err();
+    match err {
+        QuarantineError::InvalidState(msg) => {
+            assert!(msg.contains(&rec.id.to_string()));
+        }
+        other => panic!("Expected InvalidState, got {other:?}"),
+    }
+
+    // Vault payload MUST remain intact and untouched
+    let vault_file = Path::new(&rec.vault_path);
+    assert!(vault_file.exists());
+    assert_eq!(fs::read(vault_file).unwrap(), b"fail closed test");
+}
+
+#[test]
+fn restore_database_rollback_failure_returns_structured_recovery_info() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("restore_rollback_db_fail.bin");
+    fs::write(&target, b"restore rollback test").unwrap();
+    let rec = qm.quarantine_file(&target, "threat").unwrap();
+
+    // Recreate destination so restore fails pre-move check, and inject RestorePreMoveRollbackDb
+    fs::write(&rec.original_path, b"conflicting destination").unwrap();
+
+    let err = qm
+        .restore_file_with_injection(rec.id, FailureInjection::RestorePreMoveRollbackDb)
+        .unwrap_err();
+
+    match err {
+        QuarantineError::RollbackFailed(info) => {
+            assert_eq!(info.stage, "check_destination");
+            assert!(info.cause.contains("destination already exists"));
+            assert!(info
+                .rollback_error
+                .contains("injected restore pre-move rollback db failure"));
+            assert_eq!(info.stranded_path, rec.vault_path);
+            assert_eq!(info.original_path, rec.original_path);
+            assert_eq!(info.sha256, rec.sha256);
+        }
+        other => panic!("Expected RollbackFailed, got {other:?}"),
+    }
 }

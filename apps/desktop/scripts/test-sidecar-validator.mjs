@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   SUPPORTED_TARGET_TRIPLES,
   validateBinaryArchitecture,
+  checkSidecar,
 } from "./prepare-sidecar.mjs";
 
 console.log("Running Sidecar Architecture Validator Tests...");
@@ -160,6 +161,81 @@ try {
   assert.throws(
     () => validateBinaryArchitecture(machBeArm, "x86_64-apple-darwin"),
     /Architecture mismatch/
+  );
+
+  // 7. checkSidecar validation tests
+  const mockBinDir = path.join(tempDir, "binaries");
+  fs.mkdirSync(mockBinDir);
+
+  // 7a. Missing target binary throws
+  assert.throws(
+    () =>
+      checkSidecar({
+        targetTriple: "x86_64-unknown-linux-gnu",
+        customBinariesDir: mockBinDir,
+      }),
+    /Missing required sidecar binary/
+  );
+
+  // 7b. Unsupported target triple throws
+  assert.throws(
+    () =>
+      checkSidecar({
+        targetTriple: "riscv64-unknown-linux-gnu",
+        customBinariesDir: mockBinDir,
+      }),
+    /Unsupported target triple/
+  );
+
+  // 7c. checkAll with empty directory throws
+  assert.throws(
+    () =>
+      checkSidecar({
+        targetTriple: "x86_64-unknown-linux-gnu",
+        checkAll: true,
+        customBinariesDir: mockBinDir,
+      }),
+    /No sidecar binaries found/
+  );
+
+  // 7d. Valid target sidecar succeeds
+  const validHostBin = path.join(
+    mockBinDir,
+    "kernlock-x86_64-unknown-linux-gnu"
+  );
+  fs.writeFileSync(validHostBin, createMockElf({ machine: 0x3e }));
+  assert.strictEqual(
+    checkSidecar({
+      targetTriple: "x86_64-unknown-linux-gnu",
+      customBinariesDir: mockBinDir,
+    }),
+    true
+  );
+
+  // 7e. Architecture mismatch in sidecar throws
+  const badArmBin = path.join(
+    mockBinDir,
+    "kernlock-aarch64-unknown-linux-gnu"
+  );
+  fs.writeFileSync(badArmBin, createMockElf({ machine: 0x3e })); // x86_64 machine code labeled as aarch64
+  assert.throws(
+    () =>
+      checkSidecar({
+        targetTriple: "aarch64-unknown-linux-gnu",
+        customBinariesDir: mockBinDir,
+      }),
+    /Architecture mismatch/
+  );
+
+  // 7f. checkAll succeeds when all present sidecars are valid
+  fs.writeFileSync(badArmBin, createMockElf({ machine: 0xb7 })); // fix to real aarch64
+  assert.strictEqual(
+    checkSidecar({
+      targetTriple: "x86_64-unknown-linux-gnu",
+      checkAll: true,
+      customBinariesDir: mockBinDir,
+    }),
+    true
   );
 
   console.log("✓ All sidecar architecture validator tests passed successfully!");

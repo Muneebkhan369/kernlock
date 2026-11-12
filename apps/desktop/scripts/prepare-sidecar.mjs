@@ -20,7 +20,7 @@ export const SUPPORTED_TARGET_TRIPLES = [
   "aarch64-apple-darwin",
 ];
 
-function getHostTargetTriple() {
+export function getHostTargetTriple() {
   const rustcInfo = execFileSync("rustc", ["-vV"], { encoding: "utf8" });
   const hostLine = rustcInfo
     .split(/\r?\n/)
@@ -31,7 +31,7 @@ function getHostTargetTriple() {
   return hostLine.slice("host:".length).trim();
 }
 
-function parseTargetTriple() {
+export function parseTargetTriple() {
   const targetIdx = process.argv.indexOf("--target");
   let triple;
   if (targetIdx !== -1 && process.argv[targetIdx + 1]) {
@@ -148,30 +148,49 @@ export function validateBinaryArchitecture(filePath, expectedTriple) {
   }
 }
 
-function runCheck() {
-  if (!fs.existsSync(binariesDir)) {
-    throw new Error(`Binaries directory does not exist: ${binariesDir}`);
+export function checkSidecar({ targetTriple, checkAll = false, customBinariesDir = null } = {}) {
+  const dir = customBinariesDir || binariesDir;
+  if (!fs.existsSync(dir)) {
+    throw new Error(`Binaries directory does not exist: ${dir}`);
   }
-  const files = fs.readdirSync(binariesDir);
-  const sidecars = files.filter((f) => f.startsWith("kernlock-"));
-  if (sidecars.length === 0) {
-    throw new Error(`No sidecar binaries found in ${binariesDir}`);
+
+  const target = targetTriple || parseTargetTriple();
+  if (!SUPPORTED_TARGET_TRIPLES.includes(target)) {
+    throw new Error(
+      `Unsupported target triple: '${target}'. Supported triples are: ${SUPPORTED_TARGET_TRIPLES.join(", ")}`
+    );
   }
-  const hostTriple = getHostTargetTriple();
-  const hostSidecar = sidecars.find(
-    (f) => f === `kernlock-${hostTriple}` || f === `kernlock-${hostTriple}.exe`
-  );
-  if (!hostSidecar) {
-    console.warn(`[WARN] Host target sidecar (kernlock-${hostTriple}) is not yet prepared in ${binariesDir}`);
+
+  const ext = target.includes("windows") ? ".exe" : "";
+  const expectedName = `kernlock-${target}${ext}`;
+  const expectedPath = path.join(dir, expectedName);
+
+  if (checkAll) {
+    const files = fs.readdirSync(dir);
+    const sidecars = files.filter((f) => f.startsWith("kernlock-"));
+    if (sidecars.length === 0) {
+      throw new Error(`No sidecar binaries found in ${dir}`);
+    }
+    for (const file of sidecars) {
+      const filePath = path.join(dir, file);
+      const tripleWithExt = file.slice("kernlock-".length);
+      const triple = tripleWithExt.replace(/\.exe$/, "");
+      console.log(`Checking ${file} against triple ${triple}...`);
+      validateBinaryArchitecture(filePath, triple);
+      console.log(`  ✓ Architecture verified for ${triple}`);
+    }
   }
-  for (const file of sidecars) {
-    const filePath = path.join(binariesDir, file);
-    const tripleWithExt = file.slice("kernlock-".length);
-    const triple = tripleWithExt.replace(/\.exe$/, "");
-    console.log(`Checking ${file} against triple ${triple}...`);
-    validateBinaryArchitecture(filePath, triple);
-    console.log(`  ✓ Architecture verified for ${triple}`);
+
+  if (!fs.existsSync(expectedPath)) {
+    throw new Error(
+      `Missing required sidecar binary for target '${target}': expected ${expectedPath}. Build or prepare it first using 'npm run prepare:sidecar' or 'node scripts/prepare-sidecar.mjs --target ${target}'`
+    );
   }
+
+  console.log(`Verifying target sidecar ${expectedName} for ${target}...`);
+  validateBinaryArchitecture(expectedPath, target);
+  console.log(`  ✓ Architecture verified for target ${target}`);
+  return true;
 }
 
 function buildAndPrepare() {
@@ -224,7 +243,9 @@ const isDirectRun =
 
 if (isDirectRun) {
   if (process.argv.includes("--check")) {
-    runCheck();
+    const checkAll = process.argv.includes("--all");
+    const targetTriple = parseTargetTriple();
+    checkSidecar({ targetTriple, checkAll });
   } else {
     buildAndPrepare();
   }
