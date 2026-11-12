@@ -23,28 +23,23 @@ impl Default for MacOsSecurityProvider {
 }
 
 impl PlatformSecurityProvider for MacOsSecurityProvider {
-    fn probe_capabilities(&self, _requested_mode: SecurityMode) -> PlatformCapabilities {
+    fn probe_capabilities(&self, requested_mode: SecurityMode) -> PlatformCapabilities {
         let capabilities = vec![
             CapabilityStatus {
                 name: "Apple Endpoint Security Framework (ESF)".to_string(),
-                supported: cfg!(target_os = "macos"),
+                supported: false,
                 enforcement_available: false,
-                active_mode: "Unavailable (Requires Apple com.apple.developer.endpoint-security.client entitlement & FDA)"
+                active_mode: "Unsupported (ESF client not implemented; requires Apple entitlement & FDA)"
                     .to_string(),
                 details: "ESF ES_EVENT_TYPE_AUTH_EXEC requires Apple-approved entitlement, notarization, and Full Disk Access."
                     .to_string(),
             },
             CapabilityStatus {
-                name: "LaunchAgents & LaunchDaemons Persistence".to_string(),
-                supported: cfg!(target_os = "macos"),
+                name: "Process & LaunchAgents/LaunchDaemons Telemetry".to_string(),
+                supported: false,
                 enforcement_available: false,
-                active_mode: if cfg!(target_os = "macos") {
-                    "Audit (~/Library/LaunchAgents, /Library/LaunchDaemons)"
-                } else {
-                    "Unavailable on non-macOS host"
-                }
-                .to_string(),
-                details: "Inspects plist startup items and login hooks for suspicious commands."
+                active_mode: "Unsupported (Native macOS provider not yet implemented)".to_string(),
+                details: "macOS process inspection and plist startup scanning are planned for Phase 3."
                     .to_string(),
             },
         ];
@@ -54,11 +49,13 @@ impl PlatformSecurityProvider for MacOsSecurityProvider {
             arch: std::env::consts::ARCH.to_string(),
             hostname: hostname_string(),
             is_privileged: false,
+            kernel_blocking_available: false,
+            auto_quarantine_available: false,
             active_mode: SecurityMode::Audit,
-            fallback_reason: Some(
-                "Apple Endpoint Security entitlement is not present; operating in Audit mode."
-                    .to_string(),
-            ),
+            fallback_reason: Some(format!(
+                "macOS native monitoring and Endpoint Security enforcement are not yet implemented (requested {:?}); operating in static-scan Audit mode only.",
+                requested_mode
+            )),
             capabilities,
         }
     }
@@ -68,29 +65,18 @@ impl PlatformSecurityProvider for MacOsSecurityProvider {
         _rules: &RuleEngine,
         _policy: &PolicyConfig,
     ) -> Result<Vec<ProcessInfo>, PlatformError> {
-        #[cfg(target_os = "macos")]
-        {
-            Ok(Vec::new())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err(PlatformError::Unsupported(
-                "macOS process enumeration is only available on macOS hosts".to_string(),
-            ))
-        }
+        Err(PlatformError::Unsupported(
+            "macOS process enumeration is not yet implemented (Phase 3)".to_string(),
+        ))
     }
 
-    fn scan_persistence(&self, _rules: &RuleEngine) -> Result<Vec<PersistenceEntry>, PlatformError> {
-        #[cfg(target_os = "macos")]
-        {
-            Ok(Vec::new())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err(PlatformError::Unsupported(
-                "macOS persistence scanning is only available on macOS hosts".to_string(),
-            ))
-        }
+    fn scan_persistence(
+        &self,
+        _rules: &RuleEngine,
+    ) -> Result<Vec<PersistenceEntry>, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "macOS persistence scanning is not yet implemented (Phase 3)".to_string(),
+        ))
     }
 
     fn scan_path(

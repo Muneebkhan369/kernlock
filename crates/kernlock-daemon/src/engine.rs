@@ -51,7 +51,10 @@ impl KernLockEngine {
     }
 
     pub fn is_watcher_active(&self) -> bool {
-        *self.watcher_active.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .watcher_active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn get_policy(&self) -> Result<PolicyConfig> {
@@ -130,10 +133,7 @@ impl KernLockEngine {
                 if caps.active_mode != SecurityMode::Audit
                     && res.risk_score >= policy.auto_quarantine_threshold
                 {
-                    match self
-                        .quarantine
-                        .quarantine_file(&res.path, &res.summary)
-                    {
+                    match self.quarantine.quarantine_file(&res.path, &res.summary) {
                         Ok(_) => {
                             action_taken = "quarantined".to_string();
                             alert_status = AlertStatus::Quarantined;
@@ -247,8 +247,8 @@ impl KernLockEngine {
         let events = self.storage.list_events(500)?;
         let alerts = self.storage.list_alerts(500)?;
         let quarantine = self.quarantine.list()?;
-        let processes = self.list_processes().unwrap_or_default();
-        let persistence = self.scan_persistence().unwrap_or_default();
+        let processes_res = self.list_processes();
+        let persistence_res = self.scan_persistence();
 
         let open_alerts = alerts
             .iter()
@@ -262,30 +262,45 @@ impl KernLockEngine {
             .iter()
             .filter(|q| q.status == kernlock_core::QuarantineStatus::Quarantined)
             .count();
-        let suspicious_processes = processes.iter().filter(|p| p.risk_score >= 40).count();
-        let suspicious_persistence = persistence.iter().filter(|p| p.risk_score >= 40).count();
+        let suspicious_processes = processes_res
+            .as_ref()
+            .ok()
+            .map(|ps| ps.iter().filter(|p| p.risk_score >= 40).count());
+        let suspicious_persistence = persistence_res
+            .as_ref()
+            .ok()
+            .map(|ps| ps.iter().filter(|p| p.risk_score >= 40).count());
 
         let mut recommendations = Vec::new();
         if let Some(reason) = &capabilities.fallback_reason {
             recommendations.push(reason.clone());
         }
-        if suspicious_processes > 0 {
-            recommendations.push(format!(
+        match suspicious_processes {
+            Some(n) if n > 0 => recommendations.push(format!(
                 "Investigate {} suspicious running process(es) flagged in Process Monitor.",
-                suspicious_processes
-            ));
+                n
+            )),
+            None => recommendations
+                .push("Process monitoring is unsupported or unavailable on this host.".to_string()),
+            _ => {}
         }
-        if suspicious_persistence > 0 {
-            recommendations.push(format!(
+        match suspicious_persistence {
+            Some(n) if n > 0 => recommendations.push(format!(
                 "Review {} suspicious persistence/startup entry(s).",
-                suspicious_persistence
-            ));
+                n
+            )),
+            None => recommendations.push(
+                "Persistence scanning is unsupported or unavailable on this host.".to_string(),
+            ),
+            _ => {}
         }
         if open_alerts > 0 {
             recommendations.push(format!("Triage {} open threat alert(s).", open_alerts));
         }
         if recommendations.is_empty() {
-            recommendations.push("No active threats detected. Keep watch paths and rules updated.".to_string());
+            recommendations.push(
+                "No active threats detected. Keep watch paths and rules updated.".to_string(),
+            );
         }
 
         Ok(SecurityReport {
@@ -308,14 +323,41 @@ impl KernLockEngine {
     pub fn format_report_markdown(&self, report: &SecurityReport) -> String {
         let mut md = String::new();
         md.push_str("# KernLock Security Report\n\n");
-        md.push_str(&format!("- **Generated At:** {}\n", report.generated_at.to_rfc3339()));
-        md.push_str(&format!("- **Host:** {} ({})\n", report.hostname, report.host_os));
+        md.push_str(&format!(
+            "- **Generated At:** {}\n",
+            report.generated_at.to_rfc3339()
+        ));
+        md.push_str(&format!(
+            "- **Host:** {} ({})\n",
+            report.hostname, report.host_os
+        ));
         md.push_str(&format!("- **Active Mode:** {:?}\n", report.security_mode));
-        md.push_str(&format!("- **Total Recorded Events:** {}\n", report.total_events));
-        md.push_str(&format!("- **Open Alerts:** {} (Critical: {})\n", report.open_alerts, report.critical_alerts));
-        md.push_str(&format!("- **Quarantined Files:** {}\n", report.quarantined_files));
-        md.push_str(&format!("- **Suspicious Processes:** {}\n", report.suspicious_processes));
-        md.push_str(&format!("- **Suspicious Persistence Entries:** {}\n\n", report.suspicious_persistence));
+        md.push_str(&format!(
+            "- **Total Recorded Events:** {}\n",
+            report.total_events
+        ));
+        md.push_str(&format!(
+            "- **Open Alerts:** {} (Critical: {})\n",
+            report.open_alerts, report.critical_alerts
+        ));
+        md.push_str(&format!(
+            "- **Quarantined Files:** {}\n",
+            report.quarantined_files
+        ));
+        md.push_str(&format!(
+            "- **Suspicious Processes:** {}\n",
+            report
+                .suspicious_processes
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "N/A (Unsupported on this platform)".to_string())
+        ));
+        md.push_str(&format!(
+            "- **Suspicious Persistence Entries:** {}\n\n",
+            report
+                .suspicious_persistence
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "N/A (Unsupported on this platform)".to_string())
+        ));
 
         md.push_str("## Recommendations\n\n");
         for rec in &report.recommendations {
@@ -338,15 +380,16 @@ impl KernLockEngine {
         tokio::spawn(async move {
             let (tx, mut rx) = mpsc::channel::<PathBuf>(256);
 
-            let watcher_res = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                if let Ok(event) = res {
-                    if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
-                        for p in event.paths {
-                            let _ = tx.blocking_send(p);
+            let watcher_res =
+                notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                    if let Ok(event) = res {
+                        if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                            for p in event.paths {
+                                let _ = tx.blocking_send(p);
+                            }
                         }
                     }
-                }
-            });
+                });
 
             let mut watcher: RecommendedWatcher = match watcher_res {
                 Ok(w) => w,

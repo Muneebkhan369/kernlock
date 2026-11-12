@@ -27,6 +27,8 @@ export interface PlatformCapabilities {
   arch: string;
   hostname: string;
   is_privileged: boolean;
+  kernel_blocking_available: boolean;
+  auto_quarantine_available: boolean;
   active_mode: SecurityMode;
   fallback_reason: string | null;
   capabilities: CapabilityStatus[];
@@ -161,8 +163,8 @@ export interface SecurityReport {
   open_alerts: number;
   critical_alerts: number;
   quarantined_files: number;
-  suspicious_processes: number;
-  suspicious_persistence: number;
+  suspicious_processes: number | null;
+  suspicious_persistence: number | null;
   top_alerts: ThreatAlert[];
   capabilities: PlatformCapabilities;
   recommendations: string[];

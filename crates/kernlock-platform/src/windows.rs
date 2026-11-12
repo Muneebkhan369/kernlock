@@ -23,37 +23,30 @@ impl Default for WindowsSecurityProvider {
 }
 
 impl PlatformSecurityProvider for WindowsSecurityProvider {
-    fn probe_capabilities(&self, _requested_mode: SecurityMode) -> PlatformCapabilities {
-        // Honest capability reporting: without a signed WDAC policy, ELAM/minifilter driver,
-        // or elevated ETW/AMSI host integration, enforcement cannot be claimed.
+    fn probe_capabilities(&self, requested_mode: SecurityMode) -> PlatformCapabilities {
         let capabilities = vec![
             CapabilityStatus {
                 name: "Windows Defender / AMSI Integration".to_string(),
-                supported: cfg!(target_os = "windows"),
+                supported: false,
                 enforcement_available: false,
-                active_mode: "Audit / Planned (Requires AMSI COM/DLL integration)".to_string(),
+                active_mode: "Unsupported (AMSI COM/DLL integration not yet implemented)".to_string(),
                 details: "Antimalware Scan Interface (AMSI) requires Windows host COM registration for script inspection."
                     .to_string(),
             },
             CapabilityStatus {
                 name: "Application Control (WDAC / AppLocker)".to_string(),
-                supported: cfg!(target_os = "windows"),
+                supported: false,
                 enforcement_available: false,
-                active_mode: "Not configured (Requires Administrator & signed CI policy)".to_string(),
+                active_mode: "Unsupported (WDAC/AppLocker provider not yet implemented)".to_string(),
                 details: "Windows Defender Application Control enforces binary allow-listing at kernel level."
                     .to_string(),
             },
             CapabilityStatus {
-                name: "Registry Run & Scheduled Task Persistence".to_string(),
-                supported: cfg!(target_os = "windows"),
+                name: "Process & Persistence Telemetry (Win32 / Registry / Tasks)".to_string(),
+                supported: false,
                 enforcement_available: false,
-                active_mode: if cfg!(target_os = "windows") {
-                    "Audit (Registry/Task inspection)"
-                } else {
-                    "Unavailable on non-Windows host"
-                }
-                .to_string(),
-                details: "Inspects HKCU/HKLM Run keys, Startup folders, and Task Scheduler entries."
+                active_mode: "Unsupported (Native Windows enumeration not yet implemented)".to_string(),
+                details: "Win32 process snapshots, HKCU/HKLM Run keys, and Task Scheduler inspection are planned for Phase 3."
                     .to_string(),
             },
         ];
@@ -63,11 +56,13 @@ impl PlatformSecurityProvider for WindowsSecurityProvider {
             arch: std::env::consts::ARCH.to_string(),
             hostname: hostname_string(),
             is_privileged: false,
+            kernel_blocking_available: false,
+            auto_quarantine_available: false,
             active_mode: SecurityMode::Audit,
-            fallback_reason: Some(
-                "Windows kernel/AMSI enforcement hooks are not attached in this build; operating in Audit mode."
-                    .to_string(),
-            ),
+            fallback_reason: Some(format!(
+                "Windows native monitoring and enforcement are not yet implemented (requested {:?}); operating in static-scan Audit mode only.",
+                requested_mode
+            )),
             capabilities,
         }
     }
@@ -77,29 +72,18 @@ impl PlatformSecurityProvider for WindowsSecurityProvider {
         _rules: &RuleEngine,
         _policy: &PolicyConfig,
     ) -> Result<Vec<ProcessInfo>, PlatformError> {
-        #[cfg(target_os = "windows")]
-        {
-            Ok(Vec::new())
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            Err(PlatformError::Unsupported(
-                "Windows process enumeration is only available on Windows hosts".to_string(),
-            ))
-        }
+        Err(PlatformError::Unsupported(
+            "Windows process enumeration is not yet implemented (Phase 3)".to_string(),
+        ))
     }
 
-    fn scan_persistence(&self, _rules: &RuleEngine) -> Result<Vec<PersistenceEntry>, PlatformError> {
-        #[cfg(target_os = "windows")]
-        {
-            Ok(Vec::new())
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            Err(PlatformError::Unsupported(
-                "Windows persistence scanning is only available on Windows hosts".to_string(),
-            ))
-        }
+    fn scan_persistence(
+        &self,
+        _rules: &RuleEngine,
+    ) -> Result<Vec<PersistenceEntry>, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "Windows persistence scanning is not yet implemented (Phase 3)".to_string(),
+        ))
     }
 
     fn scan_path(

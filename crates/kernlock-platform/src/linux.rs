@@ -39,6 +39,32 @@ impl LinuxSecurityProvider {
             .map(|s| s.trim().split(',').map(|x| x.to_string()).collect())
             .unwrap_or_default()
     }
+
+    fn probe_fanotify_init() -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            // Probe actual fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC, O_RDONLY)
+            // without relying solely on UID == 0 (containers/capabilities may differ).
+            let fd = unsafe {
+                libc::fanotify_init(
+                    libc::FAN_CLASS_CONTENT | libc::FAN_CLOEXEC,
+                    libc::O_RDONLY as u32,
+                )
+            };
+            if fd >= 0 {
+                unsafe {
+                    libc::close(fd);
+                }
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error().to_string())
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err("fanotify is Linux-only".to_string())
+        }
+    }
 }
 
 impl Default for LinuxSecurityProvider {
@@ -56,21 +82,27 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
             || Path::new("/usr/sbin/auditd").exists()
             || Path::new("/run/auditd.pid").exists();
 
-        let fanotify_enforcing = is_root;
+        let fanotify_probe = Self::probe_fanotify_init();
         let inotify_supported = Path::new("/proc/sys/fs/inotify/max_user_watches").exists();
 
-        let (active_mode, fallback_reason) = if requested_mode == SecurityMode::Audit {
-            (SecurityMode::Audit, None)
-        } else if !is_root {
-            (
-                SecurityMode::Audit,
-                Some(
-                    "Running without root/CAP_SYS_ADMIN privileges: fanotify blocking and kernel enforcement are unavailable. Safely operating in Audit mode."
-                        .to_string(),
-                ),
-            )
-        } else {
-            (requested_mode, None)
+        // Kernel pre-execution blocking (fanotify FAN_OPEN_PERM loop) is not yet implemented
+        // in KernLock Phase 1.1. Never claim kernel-level execution blocking is active.
+        let kernel_blocking_available = false;
+        let auto_quarantine_available = true;
+
+        let (active_mode, fallback_reason) = match requested_mode {
+            SecurityMode::Audit => (SecurityMode::Audit, None),
+            SecurityMode::Protection | SecurityMode::Strict => (
+                requested_mode,
+                Some(format!(
+                    "Pre-execution kernel blocking is unavailable in this build ({}). {:?} mode performs post-write detection and automatic quarantine only.",
+                    match &fanotify_probe {
+                        Ok(_) => "fanotify_init succeeded, but KernLock FAN_OPEN_PERM enforcement loop is not yet implemented".to_string(),
+                        Err(e) => format!("fanotify_init unavailable: {}", e),
+                    },
+                    requested_mode
+                )),
+            ),
         };
 
         let capabilities = vec![
@@ -79,7 +111,7 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
                 supported: inotify_supported,
                 enforcement_available: false,
                 active_mode: if inotify_supported {
-                    "Audit (Real-time event monitoring)".to_string()
+                    "Active (Post-write event monitoring)".to_string()
                 } else {
                     "Unavailable".to_string()
                 },
@@ -87,21 +119,32 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
                     .to_string(),
             },
             CapabilityStatus {
-                name: "Pre-Execution / Access Blocking (fanotify)".to_string(),
+                name: "Automatic Post-Write Quarantine".to_string(),
                 supported: true,
-                enforcement_available: fanotify_enforcing,
-                active_mode: if fanotify_enforcing {
-                    "Available (CAP_SYS_ADMIN present)".to_string()
+                enforcement_available: true,
+                active_mode: if requested_mode == SecurityMode::Audit {
+                    "Standby (Audit mode active)".to_string()
                 } else {
-                    "Audit fallback (Requires root / CAP_SYS_ADMIN)".to_string()
+                    "Active (Moves high-risk files to 0600 vault)".to_string()
                 },
-                details: "Linux fanotify FAN_OPEN_PERM requires CAP_SYS_ADMIN to intercept and deny file opens."
+                details: "Reversibly quarantines high-risk files after detection when Protection or Strict mode is enabled."
+                    .to_string(),
+            },
+            CapabilityStatus {
+                name: "Pre-Execution / Access Blocking (fanotify)".to_string(),
+                supported: fanotify_probe.is_ok(),
+                enforcement_available: false,
+                active_mode: match &fanotify_probe {
+                    Ok(_) => "Unavailable (Kernel probe OK, KernLock blocking loop not implemented)".to_string(),
+                    Err(e) => format!("Unavailable ({})", e),
+                },
+                details: "Requires CAP_SYS_ADMIN and KernLock's Phase 2 FAN_OPEN_PERM event loop; not active in Phase 1.1."
                     .to_string(),
             },
             CapabilityStatus {
                 name: "Process Telemetry (/proc)".to_string(),
                 supported: Path::new("/proc").exists(),
-                enforcement_available: is_root,
+                enforcement_available: false,
                 active_mode: "Active (Live process inspection)".to_string(),
                 details: "Inspects running PIDs, command lines, executable paths, and deleted-binary anomalies."
                     .to_string(),
@@ -109,25 +152,25 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
             CapabilityStatus {
                 name: "Linux Security Modules (LSM)".to_string(),
                 supported: !lsms.is_empty(),
-                enforcement_available: is_root && !lsms.is_empty(),
+                enforcement_available: false,
                 active_mode: if lsms.is_empty() {
                     "Not detected".to_string()
                 } else {
-                    format!("Kernel LSMs: {}", lsms.join(", "))
+                    format!("Detected: {}", lsms.join(", "))
                 },
-                details: "Kernel-level MAC/sandboxing subsystems reported via /sys/kernel/security/lsm."
+                details: "Kernel-level MAC/sandboxing subsystems reported via /sys/kernel/security/lsm (read-only telemetry)."
                     .to_string(),
             },
             CapabilityStatus {
                 name: "eBPF / Audit Subsystem".to_string(),
                 supported: has_bpf_fs || has_auditd,
-                enforcement_available: is_root && has_bpf_fs,
+                enforcement_available: false,
                 active_mode: format!(
                     "bpffs={}, auditd={}",
                     if has_bpf_fs { "mounted" } else { "absent" },
                     if has_auditd { "present" } else { "absent" }
                 ),
-                details: "Kernel tracing and audit infrastructure; requires CAP_BPF/CAP_SYS_ADMIN for live eBPF probes."
+                details: "Kernel tracing and audit infrastructure; eBPF probes are not yet attached in Phase 1.1."
                     .to_string(),
             },
         ];
@@ -137,6 +180,8 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
             arch: std::env::consts::ARCH.to_string(),
             hostname: hostname_string(),
             is_privileged: is_root,
+            kernel_blocking_available,
+            auto_quarantine_available,
             active_mode,
             fallback_reason,
             capabilities,
@@ -339,7 +384,10 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
             if let Ok(content) = fs::read_to_string(&path) {
                 for (idx, line) in content.lines().enumerate() {
                     let trimmed = line.trim();
-                    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.contains('=') && !trimmed.contains(' ') {
+                    if trimmed.is_empty()
+                        || trimmed.starts_with('#')
+                        || trimmed.contains('=') && !trimmed.contains(' ')
+                    {
                         continue;
                     }
                     let matches = evaluate_persistence(rules, trimmed);
@@ -421,7 +469,7 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
             }
         }
 
-        entries.sort_by(|a, b| b.risk_score.cmp(&a.risk_score));
+        entries.sort_by_key(|a| std::cmp::Reverse(a.risk_score));
         Ok(entries)
     }
 

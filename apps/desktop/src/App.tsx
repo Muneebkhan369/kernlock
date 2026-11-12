@@ -11,7 +11,7 @@ import {
   Shield,
   Terminal,
 } from "lucide-react";
-import { api } from "./api";
+import { api, getApiToken, setApiToken } from "./api";
 import type {
   CommandAnalysisResult,
   DetectionRuleDef,
@@ -50,6 +50,7 @@ export default function App() {
   const [reportMd, setReportMd] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
+  const [tokenInput, setTokenInput] = useState<string>(() => getApiToken());
 
   // Scanner & Analyzer state
   const [scanPathInput, setScanPathInput] = useState<string>("/tmp");
@@ -269,6 +270,34 @@ export default function App() {
 
         {error && <div className="banner banner-error">Error: {error}</div>}
 
+        {(!status || (error && (error.includes("401") || error.toLowerCase().includes("unauthorized") || error.toLowerCase().includes("bearer")))) && (
+          <div className="card" style={{ marginBottom: 16 }}>
+            <h3 style={{ marginTop: 0 }}>Daemon API Authentication</h3>
+            <p style={{ color: "var(--muted)", fontSize: "0.88rem" }}>
+              Enter the local Bearer token from <code>~/.local/share/kernlock/auth.token</code> (or pass <code>?token=...</code> in dev mode).
+            </p>
+            <div className="row">
+              <input
+                className="input"
+                type="password"
+                placeholder="Paste KernLock API Bearer token..."
+                value={tokenInput}
+                onChange={(e) => setTokenInput(e.target.value)}
+                style={{ flex: 1 }}
+              />
+              <button
+                className="btn"
+                onClick={() => {
+                  setApiToken(tokenInput);
+                  refreshOverview();
+                }}
+              >
+                Connect
+              </button>
+            </div>
+          </div>
+        )}
+
         {status?.capabilities.fallback_reason && (
           <div className="banner banner-warn">
             <strong>Capability Notice:</strong> {status.capabilities.fallback_reason}
@@ -283,9 +312,27 @@ export default function App() {
                 <div className="metric-value">{status.capabilities.active_mode.toUpperCase()}</div>
               </div>
               <div className="card">
+                <div className="metric-label">Kernel Blocking</div>
+                <div className="metric-value">
+                  {status.capabilities.kernel_blocking_available ? "ACTIVE" : "UNAVAILABLE"}
+                </div>
+              </div>
+              <div className="card">
+                <div className="metric-label">Auto-Quarantine</div>
+                <div className="metric-value">
+                  {!status.capabilities.auto_quarantine_available
+                    ? "UNSUPPORTED"
+                    : status.policy.mode === "audit"
+                      ? "STANDBY"
+                      : "ACTIVE"}
+                </div>
+              </div>
+              <div className="card">
                 <div className="metric-label">Real-Time File Watcher</div>
                 <div className="metric-value">{status.watcher_active ? "ACTIVE" : "IDLE"}</div>
               </div>
+            </div>
+            <div className="grid-4" style={{ marginTop: 12 }}>
               <div className="card">
                 <div className="metric-label">Open Threat Alerts</div>
                 <div className="metric-value">{openAlerts.length}</div>
@@ -732,6 +779,24 @@ export default function App() {
               >
                 Export Markdown
               </button>
+            </div>
+            <div className="grid-4" style={{ marginBottom: 12 }}>
+              <div className="card">
+                <div className="metric-label">Suspicious Processes</div>
+                <div className="metric-value">{report.suspicious_processes ?? "N/A (Unsupported)"}</div>
+              </div>
+              <div className="card">
+                <div className="metric-label">Suspicious Persistence</div>
+                <div className="metric-value">{report.suspicious_persistence ?? "N/A (Unsupported)"}</div>
+              </div>
+              <div className="card">
+                <div className="metric-label">Open Alerts</div>
+                <div className="metric-value">{report.open_alerts}</div>
+              </div>
+              <div className="card">
+                <div className="metric-label">Quarantined Files</div>
+                <div className="metric-value">{report.quarantined_files}</div>
+              </div>
             </div>
             <pre className="mono" style={{ whiteSpace: "pre-wrap", background: "var(--bg)", padding: 14, borderRadius: 8 }}>
               {reportMd}

@@ -2,22 +2,17 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecurityMode {
     /// Observe, analyze, and alert without blocking or altering system state.
+    #[default]
     Audit,
     /// Block or quarantine high-confidence threats when OS enforcement is available;
     /// safely fall back to Audit when enforcement is unsupported.
     Protection,
     /// Aggressive policy enforcement, strict path/binary restrictions, and immediate quarantine.
     Strict,
-}
-
-impl Default for SecurityMode {
-    fn default() -> Self {
-        Self::Audit
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -189,6 +184,8 @@ pub struct PlatformCapabilities {
     pub arch: String,
     pub hostname: String,
     pub is_privileged: bool,
+    pub kernel_blocking_available: bool,
+    pub auto_quarantine_available: bool,
     pub active_mode: SecurityMode,
     pub fallback_reason: Option<String>,
     pub capabilities: Vec<CapabilityStatus>,
@@ -226,8 +223,8 @@ pub struct SecurityReport {
     pub open_alerts: usize,
     pub critical_alerts: usize,
     pub quarantined_files: usize,
-    pub suspicious_processes: usize,
-    pub suspicious_persistence: usize,
+    pub suspicious_processes: Option<usize>,
+    pub suspicious_persistence: Option<usize>,
     pub top_alerts: Vec<ThreatAlert>,
     pub capabilities: PlatformCapabilities,
     pub recommendations: Vec<String>,

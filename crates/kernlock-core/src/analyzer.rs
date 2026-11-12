@@ -64,7 +64,11 @@ pub fn detect_file_type(path: &str, bytes: &[u8]) -> String {
     {
         return "Script".to_string();
     }
-    if bytes.iter().take(512).all(|&b| b == b'\n' || b == b'\r' || b == b'\t' || (b >= 0x20 && b <= 0x7e)) {
+    if bytes
+        .iter()
+        .take(512)
+        .all(|&b| b == b'\n' || b == b'\r' || b == b'\t' || (0x20..=0x7e).contains(&b))
+    {
         return "UTF-8/ASCII text".to_string();
     }
     "Binary data".to_string()
@@ -174,7 +178,10 @@ pub fn analyze_file_bytes(
 
     // High entropy heuristic for executables (packed/encrypted payloads),
     // intentionally avoiding false positives on compressed archives.
-    if (lower_type.contains("executable") || lower_type.contains("script")) && entropy > 7.35 && size_bytes > 4096 {
+    if (lower_type.contains("executable") || lower_type.contains("script"))
+        && entropy > 7.35
+        && size_bytes > 4096
+    {
         matches.push(RuleMatch {
             rule_id: "KL-HEUR-ENTROPY".to_string(),
             rule_name: "High Shannon Entropy in Executable/Script".to_string(),

@@ -168,7 +168,19 @@ impl Storage {
 
         let mut out = Vec::new();
         for r in rows {
-            let (id_str, ts_str, cat_str, sev_str, title, description, target, risk_score, action_taken, rule_ids_str, metadata_str) = r?;
+            let (
+                id_str,
+                ts_str,
+                cat_str,
+                sev_str,
+                title,
+                description,
+                target,
+                risk_score,
+                action_taken,
+                rule_ids_str,
+                metadata_str,
+            ) = r?;
             let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
             let timestamp = DateTime::parse_from_rfc3339(&ts_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -317,20 +329,26 @@ impl Storage {
             .optional()?;
 
         match row {
-            Some((id_s, orig, vault, sha, mode, size, reason, q_at, r_at, status_s)) => Ok(QuarantineRecord {
-                id: Uuid::parse_str(&id_s).unwrap_or_else(|_| Uuid::new_v4()),
-                original_path: orig,
-                vault_path: vault,
-                sha256: sha,
-                original_mode: mode as u32,
-                size_bytes: size as u64,
-                reason,
-                quarantined_at: DateTime::parse_from_rfc3339(&q_at)
-                    .map(|d| d.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-                restored_at: r_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
-                status: serde_json::from_str(&status_s)?,
-            }),
+            Some((id_s, orig, vault, sha, mode, size, reason, q_at, r_at, status_s)) => {
+                Ok(QuarantineRecord {
+                    id: Uuid::parse_str(&id_s).unwrap_or_else(|_| Uuid::new_v4()),
+                    original_path: orig,
+                    vault_path: vault,
+                    sha256: sha,
+                    original_mode: mode as u32,
+                    size_bytes: size as u64,
+                    reason,
+                    quarantined_at: DateTime::parse_from_rfc3339(&q_at)
+                        .map(|d| d.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    restored_at: r_at.and_then(|s| {
+                        DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|d| d.with_timezone(&Utc))
+                    }),
+                    status: serde_json::from_str(&status_s)?,
+                })
+            }
             None => Err(StorageError::NotFound(format!("quarantine {}", id))),
         }
     }
@@ -370,7 +388,11 @@ impl Storage {
                 quarantined_at: DateTime::parse_from_rfc3339(&q_at)
                     .map(|d| d.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now()),
-                restored_at: r_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
+                restored_at: r_at.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc))
+                }),
                 status: serde_json::from_str(&status_s)?,
             });
         }

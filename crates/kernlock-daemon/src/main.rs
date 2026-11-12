@@ -1,16 +1,17 @@
-mod api;
-mod engine;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use engine::KernLockEngine;
+use kernlock_daemon::{api, auth, engine::KernLockEngine};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "kernlock", version, about = "KernLock Security — Detect. Block. Explain.")]
+#[command(
+    name = "kernlock",
+    version,
+    about = "KernLock Security — Detect. Block. Explain."
+)]
 struct Cli {
     #[arg(long, help = "Directory for SQLite database and quarantine vault")]
     data_dir: Option<PathBuf>,
@@ -82,10 +83,15 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Serve { port, ui_dir } => {
+            let api_token = auth::load_or_create_token(&data_dir)?;
             engine.start_realtime_watcher();
-            let app = api::build_router(engine, ui_dir);
+            let app = api::build_router(engine, api_token, ui_dir);
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            info!("KernLock daemon listening on http://{}", addr);
+            info!(
+                "KernLock daemon listening on http://{} (Bearer token stored in {}/auth.token)",
+                addr,
+                data_dir.display()
+            );
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(listener, app).await?;
         }

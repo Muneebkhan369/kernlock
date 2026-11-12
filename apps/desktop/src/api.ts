@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import type {
   AlertStatus,
   CommandAnalysisResult,
@@ -13,15 +14,58 @@ import type {
   ThreatAlert,
 } from "./types";
 
-const BASE_URL =
-  typeof window !== "undefined" && window.location.protocol === "tauri:"
-    ? "http://127.0.0.1:17420"
-    : "";
+const isTauri =
+  typeof window !== "undefined" &&
+  (window.location.protocol === "tauri:" || "__TAURI_INTERNALS__" in window);
+
+const BASE_URL = isTauri ? "http://127.0.0.1:17420" : "";
+const TOKEN_STORAGE_KEY = "kernlock_api_token";
+
+export function getApiToken(): string {
+  if (typeof window === "undefined") return "";
+  const urlToken = new URLSearchParams(window.location.search).get("token");
+  if (urlToken) {
+    sessionStorage.setItem(TOKEN_STORAGE_KEY, urlToken);
+    return urlToken;
+  }
+  return sessionStorage.getItem(TOKEN_STORAGE_KEY) || "";
+}
+
+export function setApiToken(token: string) {
+  if (typeof window !== "undefined") {
+    sessionStorage.setItem(TOKEN_STORAGE_KEY, token.trim());
+  }
+}
+
+export async function resolveInitialToken(): Promise<string> {
+  const existing = getApiToken();
+  if (existing) return existing;
+  if (isTauri) {
+    try {
+      const tauriToken = await invoke<string>("get_api_token");
+      if (tauriToken) {
+        setApiToken(tauriToken);
+        return tauriToken;
+      }
+    } catch {
+      // Fall back to manual token prompt if auth.token is not yet created
+    }
+  }
+  return "";
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = await resolveInitialToken();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(init?.headers as Record<string, string> | undefined),
+  };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
   const res = await fetch(`${BASE_URL}${path}`, {
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
     ...init,
+    headers,
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
@@ -31,9 +75,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 async function requestText(path: string): Promise<string> {
-  const res = await fetch(`${BASE_URL}${path}`);
+  const token = await resolveInitialToken();
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
   if (!res.ok) {
-    throw new Error(`Request failed (${res.status})`);
+    const body = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(body.error || `Request failed (${res.status})`);
   }
   return res.text();
 }

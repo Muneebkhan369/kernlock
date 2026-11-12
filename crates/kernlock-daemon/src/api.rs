@@ -1,21 +1,25 @@
+use crate::auth::{constant_time_eq, is_allowed_origin, is_valid_loopback_host};
 use crate::engine::KernLockEngine;
 use axum::{
-    extract::{Path as AxumPath, State},
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{Path as AxumPath, Request, State},
+    http::{header, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
 use kernlock_core::{AlertStatus, PolicyConfig};
+use kernlock_platform::PlatformError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
     pub engine: KernLockEngine,
+    pub api_token: String,
 }
 
 #[derive(Serialize)]
@@ -56,11 +60,75 @@ fn err_resp(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Err
     (status, Json(ErrorResponse { error: msg.into() }))
 }
 
-pub fn build_router(engine: KernLockEngine, static_dir: Option<PathBuf>) -> Router {
-    let state = AppState { engine };
+fn map_platform_error(err: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    if let Some(PlatformError::Unsupported(msg)) = err.downcast_ref::<PlatformError>() {
+        return err_resp(StatusCode::NOT_IMPLEMENTED, msg.clone());
+    }
+    err_resp(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+}
 
-    let api = Router::new()
-        .route("/api/health", get(health))
+async fn security_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    // 1. Validate Host header against DNS rebinding
+    if let Some(host_val) = req.headers().get(header::HOST) {
+        let host_str = host_val
+            .to_str()
+            .map_err(|_| err_resp(StatusCode::FORBIDDEN, "Invalid Host header"))?;
+        if !is_valid_loopback_host(host_str) {
+            return Err(err_resp(
+                StatusCode::FORBIDDEN,
+                "Forbidden: non-loopback Host header rejected",
+            ));
+        }
+    }
+
+    // 2. Validate Origin header when present
+    if let Some(origin_val) = req.headers().get(header::ORIGIN) {
+        let origin_str = origin_val
+            .to_str()
+            .map_err(|_| err_resp(StatusCode::FORBIDDEN, "Invalid Origin header"))?;
+        if !is_allowed_origin(origin_str) {
+            return Err(err_resp(
+                StatusCode::FORBIDDEN,
+                "Forbidden: unauthorized Origin rejected",
+            ));
+        }
+    }
+
+    // 3. Allow CORS preflight OPTIONS after Origin/Host checks
+    if req.method() == Method::OPTIONS {
+        return Ok(next.run(req).await);
+    }
+
+    // 4. Require Bearer token authentication
+    let auth_header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| err_resp(StatusCode::UNAUTHORIZED, "Missing Authorization header"))?;
+
+    let provided = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| err_resp(StatusCode::UNAUTHORIZED, "Invalid Authorization scheme"))?;
+
+    if !constant_time_eq(provided.as_bytes(), state.api_token.as_bytes()) {
+        return Err(err_resp(StatusCode::UNAUTHORIZED, "Invalid API token"));
+    }
+
+    Ok(next.run(req).await)
+}
+
+pub fn build_router(
+    engine: KernLockEngine,
+    api_token: String,
+    static_dir: Option<PathBuf>,
+) -> Router {
+    let state = AppState { engine, api_token };
+
+    let protected_api = Router::new()
         .route("/api/status", get(get_status))
         .route("/api/processes", get(get_processes))
         .route("/api/persistence", get(get_persistence))
@@ -69,21 +137,39 @@ pub fn build_router(engine: KernLockEngine, static_dir: Option<PathBuf>) -> Rout
         .route("/api/events", get(list_events))
         .route("/api/alerts", get(list_alerts))
         .route("/api/alerts/:id/status", post(update_alert_status))
-        .route("/api/quarantine", get(list_quarantine).post(quarantine_file))
+        .route(
+            "/api/quarantine",
+            get(list_quarantine).post(quarantine_file),
+        )
         .route("/api/quarantine/:id/restore", post(restore_quarantine))
         .route("/api/quarantine/:id", delete(delete_quarantine))
         .route("/api/policy", get(get_policy).put(update_policy))
         .route("/api/rules", get(list_rules))
         .route("/api/report", get(get_report))
         .route("/api/report/markdown", get(get_report_markdown))
-        .with_state(state);
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_middleware,
+        ))
+        .with_state(state.clone());
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
+            origin.to_str().map(is_allowed_origin).unwrap_or(false)
+        }))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
-    let router = api.layer(cors);
+    let router = Router::new()
+        .route("/api/health", get(health))
+        .merge(protected_api)
+        .layer(cors);
 
     if let Some(dir) = static_dir {
         if dir.exists() {
@@ -115,7 +201,7 @@ async fn get_processes(
         .engine
         .list_processes()
         .map(Json)
-        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(map_platform_error)
 }
 
 async fn get_persistence(
@@ -125,7 +211,7 @@ async fn get_persistence(
         .engine
         .scan_persistence()
         .map(Json)
-        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(map_platform_error)
 }
 
 async fn scan_path(

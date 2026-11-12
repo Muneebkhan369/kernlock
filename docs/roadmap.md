@@ -9,6 +9,13 @@
 - [x] React + TypeScript security console + Tauri 2 desktop configuration
 - [x] Unit & integration tests with harmless fixtures
 
+## Phase 1.1 — Security Hardening & Reliability (Completed)
+- [x] Loopback-only Axum API with `Host`/`Origin` validation and per-installation `0600` Bearer token authentication
+- [x] Honest Linux `fanotify_init` syscall probing and separation of post-write auto-quarantine vs unavailable kernel pre-execution blocking
+- [x] Failure-safe quarantine and restore with `O_NOFOLLOW`/symlink rejection, vault-path rejection, and automatic rollback on permission/DB failures
+- [x] Honest `PlatformError::Unsupported` (`501 Not Implemented`) reporting for unimplemented Windows & macOS process/persistence subsystems
+- [x] Official Tauri 2 CLI (`@tauri-apps/cli`, `@tauri-apps/api`) integration with `get_api_token` IPC and `.github/workflows/ci.yml`
+
 ## Phase 2 — Privileged Linux Enforcement & YARA/Sigma Parity
 - [ ] Privileged `fanotify` (`FAN_OPEN_PERM`) helper daemon with PolicyKit/sudo privilege separation
 - [ ] Optional `libyara` / `yara-x` integration for native `.yar` rule files
