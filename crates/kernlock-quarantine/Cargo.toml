@@ -1,0 +1,15 @@
+[package]
+name = "kernlock-quarantine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernlock-core = { path = "../kernlock-core" }
+kernlock-storage = { path = "../kernlock-storage" }
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

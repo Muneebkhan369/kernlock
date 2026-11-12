@@ -1,0 +1,181 @@
+version: "1.0"
+rules:
+  - id: "KL-CMD-001"
+    name: "Download and Execute via Pipe to Shell"
+    target: command
+    category: command
+    severity: critical
+    score: 90
+    case_insensitive: true
+    pattern: "(curl|wget)\\s+[^|;&\\n]+\\|\\s*(ba)?sh"
+    explanation: "Downloads remote content and pipes it directly into a shell interpreter without inspection or signature verification."
+    remediation: "Download the script to a temporary file, inspect its contents and checksum, and avoid piping untrusted URLs directly to sh/bash."
+    tags: ["execution", "t1059", "sigma-compatible"]
+
+  - id: "KL-CMD-002"
+    name: "Interactive Bash Reverse Shell (/dev/tcp or /dev/udp)"
+    target: command
+    category: command
+    severity: critical
+    score: 95
+    case_insensitive: true
+    pattern: "(bash|sh)\\s+-i\\s+>&\\s+/dev/(tcp|udp)/[0-9a-zA-Z.-]+/[0-9]+"
+    explanation: "Attempts to redirect an interactive shell session over a raw TCP/UDP socket, a classic reverse shell technique."
+    remediation: "Terminate the process immediately if unauthorized, block the destination IP/port, and audit how the command was invoked."
+    tags: ["reverse-shell", "t1059.004"]
+
+  - id: "KL-CMD-003"
+    name: "Netcat / Ncat / Socat Shell Execution"
+    target: command
+    category: command
+    severity: critical
+    score: 92
+    case_insensitive: true
+    pattern: "(nc|ncat|netcat)\\s+.*(-e|-c)\\s+(/bin/)?(ba)?sh|socat\\s+.*EXEC:(/bin/)?(ba)?sh"
+    explanation: "Spawns an interactive shell attached to a network socket using netcat or socat."
+    remediation: "Verify whether this is an authorized administrative session; otherwise terminate and inspect parent processes."
+    tags: ["reverse-shell", "bind-shell"]
+
+  - id: "KL-CMD-004"
+    name: "Base64 Decoded Payload Piped to Shell/Eval"
+    target: command
+    category: command
+    severity: high
+    score: 80
+    case_insensitive: true
+    pattern: "base64\\s+(-d|--decode).*\\|\\s*(ba)?sh|eval\\s+\\$\\(\\s*echo\\s+[^|]+\\|\\s*base64\\s+(-d|--decode)"
+    explanation: "Decodes an obfuscated base64 string and immediately executes it in a shell, often used to bypass simple string filters."
+    remediation: "Decode the base64 payload offline (without executing) to inspect its true behavior."
+    tags: ["obfuscation", "t1027"]
+
+  - id: "KL-CMD-005"
+    name: "Python Socket Reverse Shell One-Liner"
+    target: command
+    category: command
+    severity: critical
+    score: 92
+    case_insensitive: false
+    pattern: "python[23]?\\s+-c\\s+.*socket\\.socket.*(dup2|pty\\.spawn|subprocess)"
+    explanation: "Executes an inline Python script that creates a network socket and binds standard I/O or a PTY to a shell."
+    remediation: "Terminate unauthorized Python processes and inspect the invoking user and parent process."
+    tags: ["reverse-shell", "python"]
+
+  - id: "KL-CMD-006"
+    name: "LD_PRELOAD Dynamic Linker Hijacking"
+    target: command
+    category: command
+    severity: high
+    score: 78
+    case_insensitive: false
+    pattern: "LD_PRELOAD\\s*=\\s*[^\\s]+\\.so|/etc/ld\\.so\\.preload"
+    explanation: "Configures LD_PRELOAD or /etc/ld.so.preload to force loading an arbitrary shared library into processes, commonly used for userland rootkits."
+    remediation: "Inspect the referenced .so file, check /etc/ld.so.preload, and remove unauthorized entries."
+    tags: ["persistence", "privilege-escalation", "t1574.006"]
+
+  - id: "KL-CMD-007"
+    name: "Destructive Root Filesystem Wipe"
+    target: command
+    category: command
+    severity: critical
+    score: 98
+    case_insensitive: false
+    pattern: "rm\\s+(-[a-zA-Z]*[rf][a-zA-Z]*\\s+)+(--no-preserve-root\\s+)?(/\\s*$|/\\*|/etc|/usr|/var|/boot)|dd\\s+if=/dev/(zero|urandom)\\s+of=/dev/[sh]d[a-z]"
+    explanation: "Attempts destructive deletion of critical system directories or raw block devices."
+    remediation: "Block execution immediately and verify operator intent."
+    tags: ["impact", "t1485"]
+
+  - id: "KL-CMD-008"
+    name: "SUID Bit or World-Writable System Permission Change"
+    target: command
+    category: command
+    severity: high
+    score: 75
+    case_insensitive: false
+    pattern: "chmod\\s+(\\+s|[0-7]*[467][0-7]{3})\\s+|chmod\\s+(-R\\s+)?777\\s+/(etc|usr|bin|sbin|root)"
+    explanation: "Sets SUID/SGID privilege bits or makes critical system directories world-writable, creating privilege escalation risk."
+    remediation: "Avoid SUID on custom binaries and restore restrictive permissions on system paths."
+    tags: ["privilege-escalation", "t1548.001"]
+
+  - id: "KL-CMD-009"
+    name: "Sensitive Credential File Access"
+    target: command
+    category: command
+    severity: high
+    score: 72
+    case_insensitive: false
+    pattern: "(cat|cp|tar|curl|scp|base64)\\s+.*(/etc/shadow|\\.ssh/id_(rsa|ed25519)|\\.aws/credentials|\\.kube/config)"
+    explanation: "Accesses or packages sensitive authentication files (shadow passwords, SSH private keys, cloud credentials)."
+    remediation: "Verify whether an authorized backup or admin tool is running; rotate keys if accessed unexpectedly."
+    tags: ["credential-access", "t1552"]
+
+  - id: "KL-FILE-001"
+    name: "Suspicious Script Containing Reverse Shell / Socket Spawn"
+    target: file_content
+    category: file
+    severity: critical
+    score: 90
+    case_insensitive: true
+    pattern: "(/dev/tcp/[0-9a-zA-Z.-]+/[0-9]+|pty\\.spawn\\(\\s*['\"]/bin/(ba)?sh|fsockopen\\([^)]+\\).*proc_open)"
+    explanation: "File contains code patterns indicative of a reverse shell or remote command backdoor."
+    remediation: "Quarantine the file and investigate how it was written to disk."
+    tags: ["malware", "backdoor"]
+
+  - id: "KL-FILE-002"
+    name: "Crypto-Miner Stratum Pool Configuration Indicator"
+    target: file_content
+    category: file
+    severity: high
+    score: 82
+    case_insensitive: true
+    pattern: "stratum\\+(tcp|ssl)://[a-zA-Z0-9.-]+:[0-9]+"
+    explanation: "File contains a Stratum mining pool URL, strongly associated with unauthorized cryptomining payloads."
+    remediation: "Quarantine the file if cryptomining is not explicitly authorized on this host."
+    tags: ["cryptominer", "t1496"]
+
+  - id: "KL-FILE-003"
+    name: "Obfuscated Eval/Exec Loader in Script"
+    target: file_content
+    category: file
+    severity: medium
+    score: 60
+    case_insensitive: true
+    pattern: "(eval|exec)\\s*\\(\\s*(base64\\.b64decode|atob|Buffer\\.from)\\s*\\("
+    explanation: "Decodes an embedded base64 blob at runtime and passes it directly to eval/exec, hiding actual behavior from static inspection."
+    remediation: "Inspect the decoded payload in an isolated environment before allowing execution."
+    tags: ["obfuscation"]
+
+  - id: "KL-PATH-001"
+    name: "Executable or Script Staged in World-Writable Temp Directory"
+    target: file_path
+    category: file
+    severity: medium
+    score: 45
+    case_insensitive: false
+    pattern: "^(/tmp|/dev/shm|/var/tmp)/(\\.|[a-zA-Z0-9_-]+\\.(sh|py|elf|bin|out|so)$)"
+    explanation: "Files placed in /tmp, /dev/shm, or /var/tmp are frequently used by staging payloads and transient malware."
+    remediation: "Verify the origin of the file; consider mounting /tmp and /dev/shm with noexec where compatible."
+    tags: ["staging", "execution"]
+
+  - id: "KL-PROC-001"
+    name: "Process Running Binary from Volatile Temp Directory"
+    target: process
+    category: process
+    severity: high
+    score: 75
+    case_insensitive: false
+    pattern: "^(/tmp|/dev/shm|/var/tmp)/"
+    explanation: "A running process is executing directly from a world-writable temporary or shared-memory directory."
+    remediation: "Inspect the binary and parent process; legitimate software rarely runs from /tmp or /dev/shm."
+    tags: ["execution", "t1059"]
+
+  - id: "KL-PERSIST-001"
+    name: "Suspicious Network or Obfuscated Command in Startup/Persistence"
+    target: persistence
+    category: persistence
+    severity: high
+    score: 85
+    case_insensitive: true
+    pattern: "(curl\\s+.*\\|\\s*(ba)?sh|wget\\s+.*\\|\\s*(ba)?sh|/dev/tcp/|nc\\s+.*-e|base64\\s+(-d|--decode)|/tmp/|/dev/shm/)"
+    explanation: "A persistence entry (systemd, cron, autostart, or shell profile) invokes a network pipe, obfuscated payload, or temporary binary."
+    remediation: "Disable or remove the suspicious persistence entry after backing up the original file."
+    tags: ["persistence", "t1053", "t1543"]

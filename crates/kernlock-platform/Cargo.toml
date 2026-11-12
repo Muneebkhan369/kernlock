@@ -1,0 +1,14 @@
+[package]
+name = "kernlock-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernlock-core = { path = "../kernlock-core" }
+thiserror.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

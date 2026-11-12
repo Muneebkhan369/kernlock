@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node / Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Tauri
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+
+# SQLite & Local Runtime Data
+*.db
+*.db-shm
+*.db-wal
+.kernlock/
+quarantine/
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
