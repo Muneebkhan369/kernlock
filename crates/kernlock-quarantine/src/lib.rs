@@ -154,8 +154,12 @@ pub enum FailureInjection {
     DestinationRaceCreated,
     RestorePreMoveRollbackDb,
     DeleteMarkDeleting,
+    DeleteVaultMetadataPermission,
+    DeleteStagingHashMismatch,
     DeleteFinalizeDb,
     DeleteFinalizeDbAndRollbackMove,
+    DeleteRollbackStagingMetadataPermission,
+    DeleteCleanupStagingMetadataPermission,
     DeleteUnlinkCleanup,
 }
 
@@ -430,18 +434,34 @@ impl QuarantineManager {
         let vault_path = PathBuf::from(&record.vault_path);
         let orig_path = PathBuf::from(&record.original_path);
 
-        if fs::symlink_metadata(&orig_path).is_ok() {
-            let cause = format!("destination already exists at {}", record.original_path);
-            self.rollback_restoring_to_quarantined(
-                &record,
-                "check_destination",
-                cause,
-                &vault_path,
-                inject,
-            )?;
-            return Err(QuarantineError::DestinationExists(
-                record.original_path.clone(),
-            ));
+        match fs::symlink_metadata(&orig_path) {
+            Ok(_) => {
+                let cause = format!("destination already exists at {}", record.original_path);
+                self.rollback_restoring_to_quarantined(
+                    &record,
+                    "check_destination",
+                    cause,
+                    &vault_path,
+                    inject,
+                )?;
+                return Err(QuarantineError::DestinationExists(
+                    record.original_path.clone(),
+                ));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // Destination does not exist: proceed safely
+            }
+            Err(e) => {
+                let cause = format!("failed reading destination metadata: {e}");
+                self.rollback_restoring_to_quarantined(
+                    &record,
+                    "check_destination_metadata",
+                    cause,
+                    &vault_path,
+                    inject,
+                )?;
+                return Err(QuarantineError::Io(e));
+            }
         }
 
         let vault_meta = match fs::symlink_metadata(&vault_path) {
@@ -733,9 +753,92 @@ impl QuarantineManager {
             return Err(QuarantineError::InvalidState(id.to_string()));
         }
 
-        // Step 2: Stage the vault file to `.deleting_<id>.locked` so DB finalization failure is recoverable.
-        if fs::symlink_metadata(&vault_path).is_ok() {
-            if let Err(e) = move_file_no_clobber(&vault_path, &deleting_path) {
+        // Step 2: Explicitly inspect vault metadata with error handling.
+        let vault_meta_res = if inject == FailureInjection::DeleteVaultMetadataPermission {
+            Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "injected delete vault metadata permission denied",
+            ))
+        } else {
+            fs::symlink_metadata(&vault_path)
+        };
+
+        match vault_meta_res {
+            Ok(m) => {
+                if m.file_type().is_symlink() {
+                    let rb_res = match self.storage.transition_quarantine_status(
+                        id,
+                        QuarantineStatus::Deleting,
+                        QuarantineStatus::Quarantined,
+                        None,
+                    ) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(
+                            "CAS transition Deleting -> Quarantined failed (0 rows updated)"
+                                .to_string(),
+                        ),
+                        Err(err) => Err(err.to_string()),
+                    };
+                    if let Err(rb_err) = rb_res {
+                        return Err(QuarantineError::RollbackFailed(Box::new(
+                            RollbackFailureInfo {
+                                stage: "delete_vault_symlink_check",
+                                cause: format!("Vault path is a symlink: {}", vault_path.display()),
+                                rollback_error: rb_err,
+                                stranded_path: vault_path.display().to_string(),
+                                original_path: record.original_path,
+                                vault_path: record.vault_path,
+                                sha256: record.sha256,
+                                original_mode: record.original_mode,
+                            },
+                        )));
+                    }
+                    return Err(QuarantineError::SymlinkRejected(
+                        vault_path.display().to_string(),
+                    ));
+                }
+                if !m.is_file() {
+                    let rb_res = match self.storage.transition_quarantine_status(
+                        id,
+                        QuarantineStatus::Deleting,
+                        QuarantineStatus::Quarantined,
+                        None,
+                    ) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(
+                            "CAS transition Deleting -> Quarantined failed (0 rows updated)"
+                                .to_string(),
+                        ),
+                        Err(err) => Err(err.to_string()),
+                    };
+                    if let Err(rb_err) = rb_res {
+                        return Err(QuarantineError::RollbackFailed(Box::new(
+                            RollbackFailureInfo {
+                                stage: "delete_vault_not_file_check",
+                                cause: format!(
+                                    "Vault path is not a regular file: {}",
+                                    vault_path.display()
+                                ),
+                                rollback_error: rb_err,
+                                stranded_path: vault_path.display().to_string(),
+                                original_path: record.original_path,
+                                vault_path: record.vault_path,
+                                sha256: record.sha256,
+                                original_mode: record.original_mode,
+                            },
+                        )));
+                    }
+                    return Err(QuarantineError::NotAFile(vault_path.display().to_string()));
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // Vault file unexpectedly missing before deletion:
+                // Preserve the unresolved Deleting state in DB so startup recovery can report it.
+                // Do NOT mark Deleted!
+                return Err(QuarantineError::Io(e));
+            }
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                // PermissionDenied on vault metadata: report filesystem failure, never continue to Deleted.
                 let rb_res = match self.storage.transition_quarantine_status(
                     id,
                     QuarantineStatus::Deleting,
@@ -752,7 +855,7 @@ impl QuarantineManager {
                 if let Err(rb_err) = rb_res {
                     return Err(QuarantineError::RollbackFailed(Box::new(
                         RollbackFailureInfo {
-                            stage: "delete_stage_move",
+                            stage: "delete_check_vault_permission",
                             cause: e.to_string(),
                             rollback_error: rb_err,
                             stranded_path: vault_path.display().to_string(),
@@ -763,14 +866,164 @@ impl QuarantineManager {
                         },
                     )));
                 }
-                return Err(e.into_quarantine_error());
+                return Err(QuarantineError::Io(e));
+            }
+            Err(e) => {
+                // Any other I/O error: report it explicitly and preserve recoverable state
+                let rb_res = match self.storage.transition_quarantine_status(
+                    id,
+                    QuarantineStatus::Deleting,
+                    QuarantineStatus::Quarantined,
+                    None,
+                ) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(
+                        "CAS transition Deleting -> Quarantined failed (0 rows updated)"
+                            .to_string(),
+                    ),
+                    Err(err) => Err(err.to_string()),
+                };
+                if let Err(rb_err) = rb_res {
+                    return Err(QuarantineError::RollbackFailed(Box::new(
+                        RollbackFailureInfo {
+                            stage: "delete_check_vault_io",
+                            cause: e.to_string(),
+                            rollback_error: rb_err,
+                            stranded_path: vault_path.display().to_string(),
+                            original_path: record.original_path,
+                            vault_path: record.vault_path,
+                            sha256: record.sha256,
+                            original_mode: record.original_mode,
+                        },
+                    )));
+                }
+                return Err(QuarantineError::Io(e));
             }
         }
 
-        // Step 3: Finalize DB status to `Deleted` using CAS.
+        // Step 3: Stage the vault file to `.deleting_<id>.locked` so DB finalization failure is recoverable.
+        if let Err(e) = move_file_no_clobber(&vault_path, &deleting_path) {
+            let rb_res = match self.storage.transition_quarantine_status(
+                id,
+                QuarantineStatus::Deleting,
+                QuarantineStatus::Quarantined,
+                None,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(
+                    "CAS transition Deleting -> Quarantined failed (0 rows updated)".to_string(),
+                ),
+                Err(err) => Err(err.to_string()),
+            };
+            if let Err(rb_err) = rb_res {
+                return Err(QuarantineError::RollbackFailed(Box::new(
+                    RollbackFailureInfo {
+                        stage: "delete_stage_move",
+                        cause: e.to_string(),
+                        rollback_error: rb_err,
+                        stranded_path: vault_path.display().to_string(),
+                        original_path: record.original_path,
+                        vault_path: record.vault_path,
+                        sha256: record.sha256,
+                        original_mode: record.original_mode,
+                    },
+                )));
+            }
+            return Err(e.into_quarantine_error());
+        }
+
+        // Step 4: Verify that the payload was successfully moved to the expected staging location
+        // and its SHA-256 matches the database record BEFORE transitioning Deleting -> Deleted.
+        let staging_bytes = match read_regular_nofollow(&deleting_path) {
+            Ok(b) => b,
+            Err(e) => {
+                let rb_res: Result<(), String> = (|| {
+                    move_file_no_clobber(&deleting_path, &vault_path)
+                        .map_err(|err| format!("move staging file back to vault failed: {err}"))?;
+                    set_mode(&vault_path, 0o600)
+                        .map_err(|err| format!("set 0600 on vault file failed: {err}"))?;
+                    match self.storage.transition_quarantine_status(
+                        id,
+                        QuarantineStatus::Deleting,
+                        QuarantineStatus::Quarantined,
+                        None,
+                    ) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(
+                            "CAS transition Deleting -> Quarantined failed (0 rows updated)"
+                                .to_string(),
+                        ),
+                        Err(err) => Err(err.to_string()),
+                    }
+                })();
+                if let Err(rb_err) = rb_res {
+                    return Err(QuarantineError::RollbackFailed(Box::new(
+                        RollbackFailureInfo {
+                            stage: "delete_verify_staging_read",
+                            cause: e.to_string(),
+                            rollback_error: rb_err,
+                            stranded_path: deleting_path.display().to_string(),
+                            original_path: record.original_path,
+                            vault_path: record.vault_path,
+                            sha256: record.sha256,
+                            original_mode: record.original_mode,
+                        },
+                    )));
+                }
+                return Err(QuarantineError::Io(e));
+            }
+        };
+
+        let staging_sha = sha256_hex(&staging_bytes);
+        if staging_sha != record.sha256 || inject == FailureInjection::DeleteStagingHashMismatch {
+            let rb_res: Result<(), String> = (|| {
+                move_file_no_clobber(&deleting_path, &vault_path)
+                    .map_err(|err| format!("move staging file back to vault failed: {err}"))?;
+                set_mode(&vault_path, 0o600)
+                    .map_err(|err| format!("set 0600 on vault file failed: {err}"))?;
+                match self.storage.transition_quarantine_status(
+                    id,
+                    QuarantineStatus::Deleting,
+                    QuarantineStatus::Quarantined,
+                    None,
+                ) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(
+                        "CAS transition Deleting -> Quarantined failed (0 rows updated)"
+                            .to_string(),
+                    ),
+                    Err(err) => Err(err.to_string()),
+                }
+            })();
+            if let Err(rb_err) = rb_res {
+                return Err(QuarantineError::RollbackFailed(Box::new(
+                    RollbackFailureInfo {
+                        stage: "delete_staging_hash_verify",
+                        cause: format!(
+                            "Staging SHA-256 mismatch: calculated {}, expected {}",
+                            staging_sha, record.sha256
+                        ),
+                        rollback_error: rb_err,
+                        stranded_path: deleting_path.display().to_string(),
+                        original_path: record.original_path,
+                        vault_path: record.vault_path,
+                        sha256: record.sha256,
+                        original_mode: record.original_mode,
+                    },
+                )));
+            }
+            return Err(QuarantineError::IntegrityMismatch(format!(
+                "Staging SHA-256 mismatch for record {}",
+                id
+            )));
+        }
+
+        // Step 5: Finalize DB status to `Deleted` using CAS.
         let finalize_res = if matches!(
             inject,
-            FailureInjection::DeleteFinalizeDb | FailureInjection::DeleteFinalizeDbAndRollbackMove
+            FailureInjection::DeleteFinalizeDb
+                | FailureInjection::DeleteFinalizeDbAndRollbackMove
+                | FailureInjection::DeleteRollbackStagingMetadataPermission
         ) {
             Err(StorageError::NotFound(
                 "injected delete finalize DB failure".to_string(),
@@ -796,10 +1049,67 @@ impl QuarantineManager {
                 if inject == FailureInjection::DeleteFinalizeDbAndRollbackMove {
                     return Err("injected delete rollback move failure".to_string());
                 }
-                if fs::symlink_metadata(&deleting_path).is_ok() {
-                    move_file_no_clobber(&deleting_path, &vault_path)
-                        .map_err(|err| format!("move staging file back to vault failed: {err}"))?;
+                let staging_meta =
+                    if inject == FailureInjection::DeleteRollbackStagingMetadataPermission {
+                        Err(io::Error::new(
+                            ErrorKind::PermissionDenied,
+                            "injected staging metadata permission denied during rollback",
+                        ))
+                    } else {
+                        fs::symlink_metadata(&deleting_path)
+                    };
+
+                match staging_meta {
+                    Ok(m) => {
+                        if m.file_type().is_symlink() {
+                            return Err(format!(
+                                "staging path is a symlink: {}",
+                                deleting_path.display()
+                            ));
+                        }
+                        if !m.is_file() {
+                            return Err(format!(
+                                "staging path is not a regular file: {}",
+                                deleting_path.display()
+                            ));
+                        }
+                        move_file_no_clobber(&deleting_path, &vault_path).map_err(|err| {
+                            format!("move staging file back to vault failed: {err}")
+                        })?;
+                        set_mode(&vault_path, 0o600).map_err(|err| {
+                            format!("set permissions 0600 on vault file failed: {err}")
+                        })?;
+                    }
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        let v_meta = fs::symlink_metadata(&vault_path).map_err(|err| {
+                            format!(
+                                "neither staging nor vault file found: staging was not found, vault check failed: {err}"
+                            )
+                        })?;
+                        if !v_meta.is_file() {
+                            return Err(format!(
+                                "vault path is not a regular file: {}",
+                                vault_path.display()
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        return Err(format!(
+                            "failed inspecting staging file metadata during rollback: {err}"
+                        ));
+                    }
                 }
+
+                // Verify that vault_path exists and has matching SHA-256 before reverting DB to Quarantined:
+                let v_bytes = read_regular_nofollow(&vault_path).map_err(|err| {
+                    format!("failed verifying restored vault file payload: {err}")
+                })?;
+                if sha256_hex(&v_bytes) != record.sha256 {
+                    return Err(
+                        "restored vault file failed SHA-256 integrity verification".to_string()
+                    );
+                }
+
                 match self.storage.transition_quarantine_status(
                     id,
                     QuarantineStatus::Deleting,
@@ -816,7 +1126,7 @@ impl QuarantineManager {
             })();
 
             if let Err(rb_err) = rollback_res {
-                let stranded = if deleting_path.exists() {
+                let stranded = if fs::symlink_metadata(&deleting_path).is_ok() {
                     &deleting_path
                 } else {
                     &vault_path
@@ -841,27 +1151,77 @@ impl QuarantineManager {
             });
         }
 
-        // Step 4: Remove staged file now that DB has committed `Deleted`.
-        if fs::symlink_metadata(&deleting_path).is_ok() {
-            let unlink_res = if inject == FailureInjection::DeleteUnlinkCleanup {
+        // Step 6: Inspect and remove staged file now that DB has committed `Deleted`.
+        let staging_cleanup_meta =
+            if inject == FailureInjection::DeleteCleanupStagingMetadataPermission {
                 Err(io::Error::new(
                     ErrorKind::PermissionDenied,
-                    "injected delete unlink cleanup failure",
+                    "injected staging metadata permission denied during final cleanup",
                 ))
             } else {
-                fs::remove_file(&deleting_path)
+                fs::symlink_metadata(&deleting_path)
             };
 
-            if let Err(e) = unlink_res {
+        match staging_cleanup_meta {
+            Ok(_) => {
+                let unlink_res = if inject == FailureInjection::DeleteUnlinkCleanup {
+                    Err(io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        "injected delete unlink cleanup failure",
+                    ))
+                } else {
+                    fs::remove_file(&deleting_path)
+                };
+
+                if let Err(e) = unlink_res {
+                    return Err(QuarantineError::CleanupFailed(Box::new(
+                        CleanupFailureInfo {
+                            operation: "delete_unlink_staging",
+                            cause: "DB marked record Deleted, but staging file removal failed"
+                                .to_string(),
+                            cleanup_error: e.to_string(),
+                            stranded_files: vec![deleting_path.display().to_string()],
+                            recovery_hint: format!(
+                                "Record {} is Deleted in DB; safely remove stranded staging file '{}'",
+                                id,
+                                deleting_path.display()
+                            ),
+                        },
+                    )));
+                }
+
+                if fs::symlink_metadata(&deleting_path).is_ok() {
+                    return Err(QuarantineError::CleanupFailed(Box::new(
+                        CleanupFailureInfo {
+                            operation: "delete_verify_unlinked",
+                            cause: "remove_file succeeded but staging file still exists"
+                                .to_string(),
+                            cleanup_error: "Staging file still present after remove_file"
+                                .to_string(),
+                            stranded_files: vec![deleting_path.display().to_string()],
+                            recovery_hint: format!(
+                                "Record {} is Deleted in DB; manually remove '{}'",
+                                id,
+                                deleting_path.display()
+                            ),
+                        },
+                    )));
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // Expected already-completed unlink: payload is gone.
+            }
+            Err(e) => {
                 return Err(QuarantineError::CleanupFailed(Box::new(
                     CleanupFailureInfo {
-                        operation: "delete_unlink_staging",
-                        cause: "DB marked record Deleted, but staging file removal failed"
-                            .to_string(),
+                        operation: "delete_inspect_staging_metadata",
+                        cause: format!(
+                            "Failed inspecting staging file metadata for final cleanup: {e}"
+                        ),
                         cleanup_error: e.to_string(),
                         stranded_files: vec![deleting_path.display().to_string()],
                         recovery_hint: format!(
-                            "Record {} is Deleted in DB; safely remove stranded staging file '{}'",
+                            "Record {} is Deleted in DB; inspect permissions on '{}'",
                             id,
                             deleting_path.display()
                         ),
@@ -970,57 +1330,13 @@ impl QuarantineManager {
                                     }
                                     QuarantineStatus::Deleting | QuarantineStatus::Quarantined => {
                                         let vault_target = PathBuf::from(&record.vault_path);
-                                        if !vault_target.exists() {
-                                            match move_file_no_clobber(&path, &vault_target) {
-                                                Ok(()) => {
-                                                    if let Err(e) = set_mode(&vault_target, 0o600) {
-                                                        report.recovery_failures.push(
-                                                            RecoveryFailure {
-                                                                id: Some(id),
-                                                                path: Some(
-                                                                    vault_target
-                                                                        .display()
-                                                                        .to_string(),
-                                                                ),
-                                                                stage: "set_mode_vault",
-                                                                error: e.to_string(),
-                                                            },
-                                                        );
-                                                        report.unresolved_states.push(
-                                                            UnresolvedRecoveryState {
-                                                                id,
-                                                                status: record.status,
-                                                                reason: format!(
-                                                                    "Failed setting permissions (0600) on recovered vault file: {e}"
-                                                                ),
-                                                            },
-                                                        );
-                                                        continue;
-                                                    }
-                                                    match self
-                                                        .storage
-                                                        .transition_quarantine_status_from_any(
-                                                            id,
-                                                            &[
-                                                                QuarantineStatus::Deleting,
-                                                                QuarantineStatus::Quarantined,
-                                                            ],
-                                                            QuarantineStatus::Quarantined,
-                                                            None,
-                                                        ) {
-                                                        Ok(true) => {
-                                                            report.recovered_to_quarantine.push(id);
-                                                        }
-                                                        Ok(false) => {
-                                                            report.unresolved_states.push(
-                                                                UnresolvedRecoveryState {
-                                                                    id,
-                                                                    status: record.status,
-                                                                    reason: "CAS Deleting->Quarantined returned false (0 rows updated)".to_string(),
-                                                                },
-                                                            );
-                                                        }
-                                                        Err(e) => {
+                                        match fs::symlink_metadata(&vault_target) {
+                                            Err(e) if e.kind() == ErrorKind::NotFound => {
+                                                match move_file_no_clobber(&path, &vault_target) {
+                                                    Ok(()) => {
+                                                        if let Err(e) =
+                                                            set_mode(&vault_target, 0o600)
+                                                        {
                                                             report.recovery_failures.push(
                                                                 RecoveryFailure {
                                                                     id: Some(id),
@@ -1029,8 +1345,7 @@ impl QuarantineManager {
                                                                             .display()
                                                                             .to_string(),
                                                                     ),
-                                                                    stage:
-                                                                        "db_transition_quarantined",
+                                                                    stage: "set_mode_vault",
                                                                     error: e.to_string(),
                                                                 },
                                                             );
@@ -1038,30 +1353,13 @@ impl QuarantineManager {
                                                                 UnresolvedRecoveryState {
                                                                     id,
                                                                     status: record.status,
-                                                                    reason: format!("Database transition Deleting->Quarantined failed: {e}"),
+                                                                    reason: format!(
+                                                                        "Failed setting permissions (0600) on recovered vault file: {e}"
+                                                                    ),
                                                                 },
                                                             );
+                                                            continue;
                                                         }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    report.recovery_failures.push(
-                                                        RecoveryFailure {
-                                                            id: Some(id),
-                                                            path: Some(path.display().to_string()),
-                                                            stage: "move_deleting_to_vault",
-                                                            error: e.to_string(),
-                                                        },
-                                                    );
-                                                }
-                                            }
-                                        } else if let Ok(vault_bytes) =
-                                            read_regular_nofollow(&vault_target)
-                                        {
-                                            if sha256_hex(&vault_bytes) == record.sha256 {
-                                                // Verified copy already in vault! Safe to remove deleting staging file.
-                                                match fs::remove_file(&path) {
-                                                    Ok(()) => {
                                                         match self
                                                             .storage
                                                             .transition_quarantine_status_from_any(
@@ -1112,52 +1410,172 @@ impl QuarantineManager {
                                                         }
                                                     }
                                                     Err(e) => {
+                                                        report.recovery_failures.push(
+                                                            RecoveryFailure {
+                                                                id: Some(id),
+                                                                path: Some(
+                                                                    path.display().to_string(),
+                                                                ),
+                                                                stage: "move_deleting_to_vault",
+                                                                error: e.to_string(),
+                                                            },
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Ok(m) => {
+                                                if !m.is_file() {
+                                                    report.recovery_failures.push(
+                                                        RecoveryFailure {
+                                                            id: Some(id),
+                                                            path: Some(
+                                                                vault_target.display().to_string(),
+                                                            ),
+                                                            stage:
+                                                                "check_vault_target_entry_recovery",
+                                                            error:
+                                                                "Vault target is not a regular file"
+                                                                    .to_string(),
+                                                        },
+                                                    );
+                                                    report.unresolved_states.push(
+                                                        UnresolvedRecoveryState {
+                                                            id,
+                                                            status: record.status,
+                                                            reason:
+                                                                "Vault target is not a regular file"
+                                                                    .to_string(),
+                                                        },
+                                                    );
+                                                    continue;
+                                                }
+                                                match read_regular_nofollow(&vault_target) {
+                                                    Ok(vault_bytes) => {
+                                                        if sha256_hex(&vault_bytes) == record.sha256
+                                                        {
+                                                            // Verified copy already in vault! Safe to remove deleting staging file.
+                                                            match fs::remove_file(&path) {
+                                                                Ok(()) => {
+                                                                    match self
+                                                                        .storage
+                                                                        .transition_quarantine_status_from_any(
+                                                                            id,
+                                                                            &[
+                                                                                QuarantineStatus::Deleting,
+                                                                                QuarantineStatus::Quarantined,
+                                                                            ],
+                                                                            QuarantineStatus::Quarantined,
+                                                                            None,
+                                                                        ) {
+                                                                        Ok(true) => {
+                                                                            report.recovered_to_quarantine.push(id);
+                                                                        }
+                                                                        Ok(false) => {
+                                                                            report.unresolved_states.push(
+                                                                                UnresolvedRecoveryState {
+                                                                                    id,
+                                                                                    status: record.status,
+                                                                                    reason: "CAS Deleting->Quarantined returned false (0 rows updated)".to_string(),
+                                                                                },
+                                                                            );
+                                                                        }
+                                                                        Err(e) => {
+                                                                            report.recovery_failures.push(
+                                                                                RecoveryFailure {
+                                                                                    id: Some(id),
+                                                                                    path: Some(
+                                                                                        vault_target
+                                                                                            .display()
+                                                                                            .to_string(),
+                                                                                    ),
+                                                                                    stage:
+                                                                                        "db_transition_quarantined",
+                                                                                    error: e.to_string(),
+                                                                                },
+                                                                            );
+                                                                            report.unresolved_states.push(
+                                                                                UnresolvedRecoveryState {
+                                                                                    id,
+                                                                                    status: record.status,
+                                                                                    reason: format!("Database transition Deleting->Quarantined failed: {e}"),
+                                                                                },
+                                                                            );
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    report
+                                                                        .recovery_failures
+                                                                        .push(RecoveryFailure {
+                                                                        id: Some(id),
+                                                                        path: Some(path.display().to_string()),
+                                                                        stage:
+                                                                            "unlink_staging_after_vault_verified",
+                                                                        error: e.to_string(),
+                                                                    });
+                                                                }
+                                                            }
+                                                        } else {
+                                                            report
+                                                                .unverified_stranded_files
+                                                                .push(UnverifiedStrandedFile {
+                                                                path: vault_target.display().to_string(),
+                                                                reason:
+                                                                    "Vault target exists but has SHA-256 mismatch"
+                                                                        .to_string(),
+                                                            });
+                                                            report.unresolved_states.push(
+                                                                UnresolvedRecoveryState {
+                                                                    id,
+                                                                    status: record.status,
+                                                                    reason:
+                                                                        "Both deleting staging file and corrupted vault copy exist"
+                                                                            .to_string(),
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
                                                         report
                                                             .recovery_failures
                                                             .push(RecoveryFailure {
                                                             id: Some(id),
-                                                            path: Some(path.display().to_string()),
+                                                            path: Some(
+                                                                vault_target.display().to_string(),
+                                                            ),
                                                             stage:
-                                                                "unlink_staging_after_vault_verified",
+                                                                "read_vault_target_entry_recovery",
                                                             error: e.to_string(),
                                                         });
+                                                        report.unresolved_states.push(
+                                                            UnresolvedRecoveryState {
+                                                                id,
+                                                                status: record.status,
+                                                                reason: format!(
+                                                                    "Vault target unreadable: {e}"
+                                                                ),
+                                                            },
+                                                        );
                                                     }
                                                 }
-                                            } else {
-                                                report
-                                                    .unverified_stranded_files
-                                                    .push(UnverifiedStrandedFile {
-                                                    path: vault_target.display().to_string(),
-                                                    reason:
-                                                        "Vault target exists but has SHA-256 mismatch"
-                                                            .to_string(),
+                                            }
+                                            Err(e) => {
+                                                report.recovery_failures.push(RecoveryFailure {
+                                                    id: Some(id),
+                                                    path: Some(vault_target.display().to_string()),
+                                                    stage: "check_vault_target_metadata",
+                                                    error: e.to_string(),
                                                 });
                                                 report.unresolved_states.push(
                                                     UnresolvedRecoveryState {
                                                         id,
                                                         status: record.status,
-                                                        reason:
-                                                            "Both deleting staging file and corrupted vault copy exist"
-                                                                .to_string(),
+                                                        reason: format!(
+                                                            "Vault target metadata unreadable: {e}"
+                                                        ),
                                                     },
                                                 );
                                             }
-                                        } else {
-                                            report.unverified_stranded_files.push(
-                                                UnverifiedStrandedFile {
-                                                    path: vault_target.display().to_string(),
-                                                    reason:
-                                                        "Vault target exists but could not be read with no-follow"
-                                                            .to_string(),
-                                                },
-                                            );
-                                            report.unresolved_states.push(UnresolvedRecoveryState {
-                                                id,
-                                                status: record.status,
-                                                reason:
-                                                    "Vault target unreadable while deleting staging file exists"
-                                                        .to_string(),
-                                            });
                                         }
                                     }
                                     QuarantineStatus::Restoring => {
@@ -1249,18 +1667,38 @@ impl QuarantineManager {
                             // Check if an independently verified good copy exists at vault_path or original_path
                             let mut verified_copy_exists = false;
 
-                            if let Ok(v_bytes) = read_regular_nofollow(Path::new(&rec.vault_path)) {
-                                if sha256_hex(&v_bytes) == rec.sha256 {
-                                    verified_copy_exists = true;
+                            match read_regular_nofollow(Path::new(&rec.vault_path)) {
+                                Ok(v_bytes) => {
+                                    if sha256_hex(&v_bytes) == rec.sha256 {
+                                        verified_copy_exists = true;
+                                    }
+                                }
+                                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                                Err(e) => {
+                                    report.recovery_failures.push(RecoveryFailure {
+                                        id: Some(rec.id),
+                                        path: Some(rec.vault_path.clone()),
+                                        stage: "verify_vault_copy_for_staging_cleanup",
+                                        error: e.to_string(),
+                                    });
                                 }
                             }
 
                             if !verified_copy_exists {
-                                if let Ok(o_bytes) =
-                                    read_regular_nofollow(Path::new(&rec.original_path))
-                                {
-                                    if sha256_hex(&o_bytes) == rec.sha256 {
-                                        verified_copy_exists = true;
+                                match read_regular_nofollow(Path::new(&rec.original_path)) {
+                                    Ok(o_bytes) => {
+                                        if sha256_hex(&o_bytes) == rec.sha256 {
+                                            verified_copy_exists = true;
+                                        }
+                                    }
+                                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                                    Err(e) => {
+                                        report.recovery_failures.push(RecoveryFailure {
+                                            id: Some(rec.id),
+                                            path: Some(rec.original_path.clone()),
+                                            stage: "verify_original_copy_for_staging_cleanup",
+                                            error: e.to_string(),
+                                        });
                                     }
                                 }
                             }
@@ -1323,94 +1761,266 @@ impl QuarantineManager {
                 .vault_dir
                 .join(format!(".deleting_{}.locked", record.id));
 
-            if vault_path.is_file() {
-                match read_regular_nofollow(&vault_path) {
-                    Ok(bytes) => {
-                        if sha256_hex(&bytes) == record.sha256 {
-                            if let Err(e) = set_mode(&vault_path, 0o600) {
-                                report.recovery_failures.push(RecoveryFailure {
-                                    id: Some(record.id),
-                                    path: Some(vault_path.display().to_string()),
-                                    stage: "revert_vault_mode_deleting",
-                                    error: e.to_string(),
-                                });
-                                report.unresolved_states.push(UnresolvedRecoveryState {
-                                    id: record.id,
-                                    status: QuarantineStatus::Deleting,
-                                    reason: format!("Failed setting vault permissions (0600) during Deleting recovery: {e}"),
-                                });
-                                continue;
-                            }
-                            match self.storage.transition_quarantine_status(
-                                record.id,
-                                QuarantineStatus::Deleting,
-                                QuarantineStatus::Quarantined,
-                                None,
-                            ) {
-                                Ok(true) => {
-                                    report.recovered_to_quarantine.push(record.id);
-                                }
-                                Ok(false) => {
-                                    report.unresolved_states.push(UnresolvedRecoveryState {
-                                        id: record.id,
-                                        status: QuarantineStatus::Deleting,
-                                        reason: "CAS Deleting->Quarantined returned false (0 rows updated)"
-                                            .to_string(),
-                                    });
-                                }
-                                Err(e) => {
+            match fs::symlink_metadata(&vault_path) {
+                Ok(m) => {
+                    if !m.is_file() {
+                        report.recovery_failures.push(RecoveryFailure {
+                            id: Some(record.id),
+                            path: Some(vault_path.display().to_string()),
+                            stage: "check_vault_file_deleting_recovery",
+                            error: "Vault path is not a regular file".to_string(),
+                        });
+                        report.unresolved_states.push(UnresolvedRecoveryState {
+                            id: record.id,
+                            status: QuarantineStatus::Deleting,
+                            reason: "Vault path exists but is not a regular file".to_string(),
+                        });
+                        continue;
+                    }
+                    match read_regular_nofollow(&vault_path) {
+                        Ok(bytes) => {
+                            if sha256_hex(&bytes) == record.sha256 {
+                                if let Err(e) = set_mode(&vault_path, 0o600) {
                                     report.recovery_failures.push(RecoveryFailure {
                                         id: Some(record.id),
                                         path: Some(vault_path.display().to_string()),
-                                        stage: "revert_deleting_to_quarantined_db",
+                                        stage: "revert_vault_mode_deleting",
                                         error: e.to_string(),
                                     });
                                     report.unresolved_states.push(UnresolvedRecoveryState {
                                         id: record.id,
                                         status: QuarantineStatus::Deleting,
                                         reason: format!(
-                                            "Database transition Deleting->Quarantined failed: {e}"
+                                            "Failed setting vault permissions (0600) during Deleting recovery: {e}"
                                         ),
                                     });
+                                    continue;
                                 }
-                            }
-                        } else {
-                            report
-                                .unverified_stranded_files
-                                .push(UnverifiedStrandedFile {
-                                    path: vault_path.display().to_string(),
-                                    reason: "Vault file SHA-256 mismatch during Deleting recovery"
-                                        .to_string(),
+                                match self.storage.transition_quarantine_status(
+                                    record.id,
+                                    QuarantineStatus::Deleting,
+                                    QuarantineStatus::Quarantined,
+                                    None,
+                                ) {
+                                    Ok(true) => {
+                                        report.recovered_to_quarantine.push(record.id);
+                                    }
+                                    Ok(false) => {
+                                        report.unresolved_states.push(UnresolvedRecoveryState {
+                                            id: record.id,
+                                            status: QuarantineStatus::Deleting,
+                                            reason: "CAS Deleting->Quarantined returned false (0 rows updated)"
+                                                .to_string(),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        report.recovery_failures.push(RecoveryFailure {
+                                            id: Some(record.id),
+                                            path: Some(vault_path.display().to_string()),
+                                            stage: "revert_deleting_to_quarantined_db",
+                                            error: e.to_string(),
+                                        });
+                                        report.unresolved_states.push(UnresolvedRecoveryState {
+                                            id: record.id,
+                                            status: QuarantineStatus::Deleting,
+                                            reason: format!(
+                                                "Database transition Deleting->Quarantined failed: {e}"
+                                            ),
+                                        });
+                                    }
+                                }
+                            } else {
+                                report
+                                    .unverified_stranded_files
+                                    .push(UnverifiedStrandedFile {
+                                        path: vault_path.display().to_string(),
+                                        reason:
+                                            "Vault file SHA-256 mismatch during Deleting recovery"
+                                                .to_string(),
+                                    });
+                                report.unresolved_states.push(UnresolvedRecoveryState {
+                                    id: record.id,
+                                    status: QuarantineStatus::Deleting,
+                                    reason: "Vault file corrupted".to_string(),
                                 });
+                            }
+                        }
+                        Err(e) => {
+                            report.recovery_failures.push(RecoveryFailure {
+                                id: Some(record.id),
+                                path: Some(vault_path.display().to_string()),
+                                stage: "read_vault_file_deleting_recovery",
+                                error: e.to_string(),
+                            });
                             report.unresolved_states.push(UnresolvedRecoveryState {
                                 id: record.id,
                                 status: QuarantineStatus::Deleting,
-                                reason: "Vault file corrupted".to_string(),
+                                reason: format!("Vault file unreadable: {e}"),
                             });
                         }
                     }
-                    Err(e) => {
-                        report.recovery_failures.push(RecoveryFailure {
-                            id: Some(record.id),
-                            path: Some(vault_path.display().to_string()),
-                            stage: "read_vault_file_deleting_recovery",
-                            error: e.to_string(),
-                        });
-                        report.unresolved_states.push(UnresolvedRecoveryState {
-                            id: record.id,
-                            status: QuarantineStatus::Deleting,
-                            reason: format!("Vault file unreadable: {e}"),
-                        });
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    // Vault file does not exist. Check deleting_path explicitly:
+                    match fs::symlink_metadata(&deleting_path) {
+                        Ok(del_meta) => {
+                            if !del_meta.is_file() {
+                                report.recovery_failures.push(RecoveryFailure {
+                                    id: Some(record.id),
+                                    path: Some(deleting_path.display().to_string()),
+                                    stage: "check_deleting_file_deleting_recovery",
+                                    error: "Deleting staging path is not a regular file"
+                                        .to_string(),
+                                });
+                                report.unresolved_states.push(UnresolvedRecoveryState {
+                                    id: record.id,
+                                    status: QuarantineStatus::Deleting,
+                                    reason: "Deleting staging path is not a regular file"
+                                        .to_string(),
+                                });
+                                continue;
+                            }
+                            match read_regular_nofollow(&deleting_path) {
+                                Ok(bytes) => {
+                                    if sha256_hex(&bytes) == record.sha256 {
+                                        match move_file_no_clobber(&deleting_path, &vault_path) {
+                                            Ok(()) => {
+                                                if let Err(e) = set_mode(&vault_path, 0o600) {
+                                                    report.recovery_failures.push(
+                                                        RecoveryFailure {
+                                                            id: Some(record.id),
+                                                            path: Some(
+                                                                vault_path.display().to_string(),
+                                                            ),
+                                                            stage: "set_mode_vault",
+                                                            error: e.to_string(),
+                                                        },
+                                                    );
+                                                    report.unresolved_states.push(UnresolvedRecoveryState {
+                                                        id: record.id,
+                                                        status: QuarantineStatus::Deleting,
+                                                        reason: format!("Failed setting permissions (0600) on recovered vault file: {e}"),
+                                                    });
+                                                    continue;
+                                                }
+                                                match self.storage.transition_quarantine_status(
+                                                    record.id,
+                                                    QuarantineStatus::Deleting,
+                                                    QuarantineStatus::Quarantined,
+                                                    None,
+                                                ) {
+                                                    Ok(true) => {
+                                                        report
+                                                            .recovered_to_quarantine
+                                                            .push(record.id);
+                                                    }
+                                                    Ok(false) => {
+                                                        report.unresolved_states.push(UnresolvedRecoveryState {
+                                                            id: record.id,
+                                                            status: QuarantineStatus::Deleting,
+                                                            reason: "CAS Deleting->Quarantined returned false (0 rows updated)".to_string(),
+                                                        });
+                                                    }
+                                                    Err(e) => {
+                                                        report
+                                                            .recovery_failures
+                                                            .push(RecoveryFailure {
+                                                            id: Some(record.id),
+                                                            path: Some(
+                                                                vault_path.display().to_string(),
+                                                            ),
+                                                            stage:
+                                                                "revert_deleting_to_quarantined_db",
+                                                            error: e.to_string(),
+                                                        });
+                                                        report.unresolved_states.push(UnresolvedRecoveryState {
+                                                            id: record.id,
+                                                            status: QuarantineStatus::Deleting,
+                                                            reason: format!("Database transition Deleting->Quarantined failed: {e}"),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                report.recovery_failures.push(RecoveryFailure {
+                                                    id: Some(record.id),
+                                                    path: Some(deleting_path.display().to_string()),
+                                                    stage: "move_deleting_to_vault",
+                                                    error: e.to_string(),
+                                                });
+                                                report.unresolved_states.push(UnresolvedRecoveryState {
+                                                    id: record.id,
+                                                    status: QuarantineStatus::Deleting,
+                                                    reason: format!("Failed moving deleting file back to vault: {e}"),
+                                                });
+                                            }
+                                        }
+                                    } else {
+                                        report.unverified_stranded_files.push(UnverifiedStrandedFile {
+                                            path: deleting_path.display().to_string(),
+                                            reason: "Deleting staging file SHA-256 mismatch during Deleting recovery".to_string(),
+                                        });
+                                        report.unresolved_states.push(UnresolvedRecoveryState {
+                                            id: record.id,
+                                            status: QuarantineStatus::Deleting,
+                                            reason: "Deleting staging file corrupted".to_string(),
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    report.recovery_failures.push(RecoveryFailure {
+                                        id: Some(record.id),
+                                        path: Some(deleting_path.display().to_string()),
+                                        stage: "read_deleting_file_deleting_recovery",
+                                        error: e.to_string(),
+                                    });
+                                    report.unresolved_states.push(UnresolvedRecoveryState {
+                                        id: record.id,
+                                        status: QuarantineStatus::Deleting,
+                                        reason: format!("Deleting staging file unreadable: {e}"),
+                                    });
+                                }
+                            }
+                        }
+                        Err(del_err) if del_err.kind() == ErrorKind::NotFound => {
+                            // NEITHER vault_path nor deleting_path exists!
+                            // Do NOT mark Deleted! Preserve DB state and report unresolved condition.
+                            report.unresolved_states.push(UnresolvedRecoveryState {
+                                id: record.id,
+                                status: QuarantineStatus::Deleting,
+                                reason: "Neither vault copy nor deleting staging copy exists on disk; cannot positively establish deletion".to_string(),
+                            });
+                        }
+                        Err(del_err) => {
+                            report.recovery_failures.push(RecoveryFailure {
+                                id: Some(record.id),
+                                path: Some(deleting_path.display().to_string()),
+                                stage: "check_deleting_path_metadata",
+                                error: del_err.to_string(),
+                            });
+                            report.unresolved_states.push(UnresolvedRecoveryState {
+                                id: record.id,
+                                status: QuarantineStatus::Deleting,
+                                reason: format!(
+                                    "Deleting staging file metadata unreadable: {del_err}"
+                                ),
+                            });
+                        }
                     }
                 }
-            } else if !deleting_path.is_file() {
-                // NEITHER vault_path nor deleting_path exists!
-                // Do NOT mark Deleted! Preserve DB state and report unresolved condition.
-                report.unresolved_states.push(UnresolvedRecoveryState {
-                    id: record.id,
-                    status: QuarantineStatus::Deleting,
-                    reason: "Neither vault copy nor deleting staging copy exists on disk; cannot positively establish deletion".to_string(),
-                });
+                Err(e) => {
+                    report.recovery_failures.push(RecoveryFailure {
+                        id: Some(record.id),
+                        path: Some(vault_path.display().to_string()),
+                        stage: "check_vault_path_metadata",
+                        error: e.to_string(),
+                    });
+                    report.unresolved_states.push(UnresolvedRecoveryState {
+                        id: record.id,
+                        status: QuarantineStatus::Deleting,
+                        reason: format!("Vault file metadata unreadable: {e}"),
+                    });
+                }
             }
         }
 
@@ -1422,17 +2032,50 @@ impl QuarantineManager {
             let orig_path = PathBuf::from(&record.original_path);
             let vault_path = PathBuf::from(&record.vault_path);
 
+            let mut orig_io_error = None;
             let orig_valid = match read_regular_nofollow(&orig_path) {
                 Ok(b) => sha256_hex(&b) == record.sha256,
-                Err(_) => false,
+                Err(e) => {
+                    if e.kind() != ErrorKind::NotFound {
+                        orig_io_error = Some(e.to_string());
+                        report.recovery_failures.push(RecoveryFailure {
+                            id: Some(record.id),
+                            path: Some(orig_path.display().to_string()),
+                            stage: "read_orig_path_restoring_recovery",
+                            error: e.to_string(),
+                        });
+                    }
+                    false
+                }
             };
 
+            let mut vault_io_error = None;
             let vault_valid = match read_regular_nofollow(&vault_path) {
                 Ok(b) => sha256_hex(&b) == record.sha256,
-                Err(_) => false,
+                Err(e) => {
+                    if e.kind() != ErrorKind::NotFound {
+                        vault_io_error = Some(e.to_string());
+                        report.recovery_failures.push(RecoveryFailure {
+                            id: Some(record.id),
+                            path: Some(vault_path.display().to_string()),
+                            stage: "read_vault_path_restoring_recovery",
+                            error: e.to_string(),
+                        });
+                    }
+                    false
+                }
             };
 
-            if orig_valid && !vault_path.exists() {
+            let vault_is_absent = matches!(
+                fs::symlink_metadata(&vault_path),
+                Err(e) if e.kind() == ErrorKind::NotFound
+            );
+            let orig_is_absent = matches!(
+                fs::symlink_metadata(&orig_path),
+                Err(e) if e.kind() == ErrorKind::NotFound
+            );
+
+            if orig_valid && vault_is_absent {
                 // Crash happened after move to destination was completed!
                 if let Err(e) = set_mode(&orig_path, record.original_mode) {
                     report.recovery_failures.push(RecoveryFailure {
@@ -1481,7 +2124,7 @@ impl QuarantineManager {
                         });
                     }
                 }
-            } else if vault_valid && !orig_path.exists() {
+            } else if vault_valid && orig_is_absent {
                 // Crash happened before move to destination! File is safe in vault.
                 if let Err(e) = set_mode(&vault_path, 0o600) {
                     report.recovery_failures.push(RecoveryFailure {
@@ -1534,10 +2177,15 @@ impl QuarantineManager {
                 }
             } else {
                 // Both exist or neither exists or corrupted: leave record in Restoring and report unresolved!
-                let reason = if orig_valid && vault_valid {
+                let reason = if orig_io_error.is_some() || vault_io_error.is_some() {
+                    format!(
+                        "I/O or permission error encountered while verifying copies (orig: {:?}, vault: {:?})",
+                        orig_io_error, vault_io_error
+                    )
+                } else if orig_valid && vault_valid {
                     "Both destination and vault files exist with valid SHA-256; will not overwrite"
                         .to_string()
-                } else if orig_path.exists() && vault_path.exists() {
+                } else if !orig_is_absent && !vault_is_absent {
                     "Both destination and vault files exist, but at least one is corrupted"
                         .to_string()
                 } else {
@@ -1585,15 +2233,55 @@ impl From<io::Error> for MoveError {
     }
 }
 
-fn read_regular_nofollow(path: &Path) -> io::Result<Vec<u8>> {
+pub fn read_regular_nofollow(path: &Path) -> io::Result<Vec<u8>> {
     let mut opts = OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        // O_NOFOLLOW: fails with ELOOP if the path is a symbolic link.
+        // O_NONBLOCK: open special files (like FIFOs or sockets) without blocking indefinitely.
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(not(unix))]
+    {
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("Refusing to follow symbolic link: {}", path.display()),
+            ));
+        }
+    }
+
     let mut file = opts.open(path)?;
+
+    // Verify metadata directly from the opened file handle to prevent TOCTOU races:
+    let meta = file.metadata()?;
+    let ft = meta.file_type();
+    if !ft.is_file() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Path is not a regular file (is_dir={}, is_symlink={}, file_type={:?}): {}",
+                ft.is_dir(),
+                ft.is_symlink(),
+                ft,
+                path.display()
+            ),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+        }
+    }
+
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
     Ok(buf)

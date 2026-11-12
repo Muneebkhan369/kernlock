@@ -1,7 +1,10 @@
 use kernlock_core::QuarantineStatus;
-use kernlock_quarantine::{FailureInjection, QuarantineError, QuarantineManager};
+use kernlock_quarantine::{
+    read_regular_nofollow, FailureInjection, QuarantineError, QuarantineManager,
+};
 use kernlock_storage::Storage;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -941,4 +944,355 @@ fn restore_database_rollback_failure_returns_structured_recovery_info() {
         }
         other => panic!("Expected RollbackFailed, got {other:?}"),
     }
+}
+
+#[test]
+fn test_1_vault_metadata_permission_denied_during_deletion() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("file1.bin");
+    fs::write(&target, b"content 1").unwrap();
+    let rec = qm.quarantine_file(&target, "threat").unwrap();
+
+    let err = qm
+        .delete_permanently_with_injection(rec.id, FailureInjection::DeleteVaultMetadataPermission)
+        .unwrap_err();
+
+    match err {
+        QuarantineError::Io(e) => {
+            assert_eq!(e.kind(), ErrorKind::PermissionDenied);
+        }
+        other => panic!("Expected QuarantineError::Io(PermissionDenied), got {other:?}"),
+    }
+
+    // Verify SQLite: record was safely rolled back to Quarantined
+    assert_eq!(
+        storage.get_quarantine(rec.id).unwrap().status,
+        QuarantineStatus::Quarantined
+    );
+    // Verify Filesystem: vault file is intact
+    let vault_path = Path::new(&rec.vault_path);
+    assert!(vault_path.exists());
+    assert_eq!(fs::read(vault_path).unwrap(), b"content 1");
+}
+
+#[test]
+fn test_2_vault_file_unexpectedly_missing_before_deletion() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("file2.bin");
+    fs::write(&target, b"content 2").unwrap();
+    let rec = qm.quarantine_file(&target, "threat").unwrap();
+
+    // Manually delete vault file before deletion attempt
+    fs::remove_file(&rec.vault_path).unwrap();
+
+    let err = qm.delete_permanently(rec.id).unwrap_err();
+    match err {
+        QuarantineError::Io(e) => {
+            assert_eq!(e.kind(), ErrorKind::NotFound);
+        }
+        other => panic!("Expected QuarantineError::Io(NotFound), got {other:?}"),
+    }
+
+    // Verify SQLite: preserved unresolved Deleting state; NOT marked Deleted!
+    assert_eq!(
+        storage.get_quarantine(rec.id).unwrap().status,
+        QuarantineStatus::Deleting
+    );
+
+    // Startup recovery flags the unresolved state
+    let report = qm.recover_on_startup().unwrap();
+    assert!(report.unresolved_states.iter().any(|u| u.id == rec.id));
+    assert_eq!(
+        storage.get_quarantine(rec.id).unwrap().status,
+        QuarantineStatus::Deleting
+    );
+}
+
+#[test]
+fn test_3_staging_metadata_permission_denied_during_rollback() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("file3.bin");
+    fs::write(&target, b"content 3").unwrap();
+    let rec = qm.quarantine_file(&target, "threat").unwrap();
+
+    let err = qm
+        .delete_permanently_with_injection(
+            rec.id,
+            FailureInjection::DeleteRollbackStagingMetadataPermission,
+        )
+        .unwrap_err();
+
+    match err {
+        QuarantineError::RollbackFailed(info) => {
+            assert_eq!(info.stage, "delete_finalize_db");
+            assert!(info
+                .rollback_error
+                .contains("staging metadata permission denied"));
+        }
+        other => panic!("Expected RollbackFailed, got {other:?}"),
+    }
+
+    // Verify SQLite: preserved Deleting state because rollback failed
+    assert_eq!(
+        storage.get_quarantine(rec.id).unwrap().status,
+        QuarantineStatus::Deleting
+    );
+    // Verify Filesystem: staging file remains stranded on disk
+    let deleting_path = vault_dir.join(format!(".deleting_{}.locked", rec.id));
+    assert!(deleting_path.exists());
+}
+
+#[test]
+fn test_4_staging_metadata_permission_denied_during_final_cleanup() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("file4.bin");
+    fs::write(&target, b"content 4").unwrap();
+    let rec = qm.quarantine_file(&target, "threat").unwrap();
+
+    let err = qm
+        .delete_permanently_with_injection(
+            rec.id,
+            FailureInjection::DeleteCleanupStagingMetadataPermission,
+        )
+        .unwrap_err();
+
+    match err {
+        QuarantineError::CleanupFailed(info) => {
+            assert_eq!(info.operation, "delete_inspect_staging_metadata");
+            assert!(info
+                .cleanup_error
+                .contains("staging metadata permission denied"));
+            assert_eq!(info.stranded_files.len(), 1);
+        }
+        other => panic!("Expected CleanupFailed, got {other:?}"),
+    }
+
+    // Verify SQLite: DB committed Deleted before final cleanup stage
+    assert_eq!(
+        storage.get_quarantine(rec.id).unwrap().status,
+        QuarantineStatus::Deleted
+    );
+    let deleting_path = vault_dir.join(format!(".deleting_{}.locked", rec.id));
+    assert!(deleting_path.exists());
+
+    // Startup recovery cleans up stranded verified file
+    let report = qm.recover_on_startup().unwrap();
+    assert!(report.finalized_deletions.contains(&rec.id));
+    assert!(!deleting_path.exists());
+}
+
+#[test]
+fn test_5_sha256_mismatch_between_vault_and_staging() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("file5.bin");
+    fs::write(&target, b"content 5").unwrap();
+    let rec = qm.quarantine_file(&target, "threat").unwrap();
+
+    let err = qm
+        .delete_permanently_with_injection(rec.id, FailureInjection::DeleteStagingHashMismatch)
+        .unwrap_err();
+
+    match err {
+        QuarantineError::IntegrityMismatch(msg) => {
+            assert!(msg.contains(&rec.id.to_string()));
+        }
+        other => panic!("Expected IntegrityMismatch, got {other:?}"),
+    }
+
+    // Verify SQLite: rolled back to Quarantined!
+    assert_eq!(
+        storage.get_quarantine(rec.id).unwrap().status,
+        QuarantineStatus::Quarantined
+    );
+    // Verify Filesystem: restored to vault, staging gone
+    let vault_path = Path::new(&rec.vault_path);
+    assert!(vault_path.exists());
+    assert_eq!(fs::read(vault_path).unwrap(), b"content 5");
+    let deleting_path = vault_dir.join(format!(".deleting_{}.locked", rec.id));
+    assert!(!deleting_path.exists());
+}
+
+#[test]
+fn test_6_fifo_rejection_by_regular_file_reader() {
+    let tmp = TempDir::new().unwrap();
+    let fifo_path = tmp.path().join("test_fifo.pipe");
+
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        let res = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(res, 0, "mkfifo must succeed");
+
+        // Calling read_regular_nofollow on FIFO must immediately fail with InvalidInput, not block indefinitely
+        let err = read_regular_nofollow(&fifo_path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a regular file"));
+
+        let _ = fs::remove_file(&fifo_path);
+    }
+}
+
+#[test]
+fn test_7_symlink_rejection() {
+    let tmp = TempDir::new().unwrap();
+    let real_file = tmp.path().join("real.txt");
+    fs::write(&real_file, b"real file content").unwrap();
+
+    let symlink_path = tmp.path().join("link.txt");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(&real_file, &symlink_path).unwrap();
+
+        // 1. read_regular_nofollow rejects symlinks
+        let err = read_regular_nofollow(&symlink_path).unwrap_err();
+        assert!(err.raw_os_error() == Some(libc::ELOOP) || err.kind() == ErrorKind::InvalidInput);
+
+        // 2. quarantine_file rejects symlinks
+        let storage = Storage::open_in_memory().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        let qm = QuarantineManager::new(&vault_dir, storage).unwrap();
+
+        let qerr = qm.quarantine_file(&symlink_path, "threat").unwrap_err();
+        match qerr {
+            QuarantineError::SymlinkRejected(p) => {
+                assert!(p.contains("link.txt"));
+            }
+            other => panic!("Expected SymlinkRejected, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_8_recovery_with_unreadable_original_copy_and_unreadable_vault_copy() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("unreadable_file.bin");
+    fs::write(&target, b"secret payload").unwrap();
+    let rec = qm.quarantine_file(&target, "threat").unwrap();
+
+    // Recreate original file so both original and vault copies exist
+    fs::write(&rec.original_path, b"secret payload").unwrap();
+
+    // Set status to Restoring
+    storage
+        .update_quarantine_status(rec.id, QuarantineStatus::Restoring, None)
+        .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Make both copies unreadable (mode 0000)
+        fs::set_permissions(&rec.original_path, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(&rec.vault_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = qm.recover_on_startup().unwrap();
+
+        let status = storage.get_quarantine(rec.id).unwrap().status;
+        assert_eq!(status, QuarantineStatus::Restoring);
+        assert!(report.unresolved_states.iter().any(|u| u.id == rec.id));
+
+        // Restore permissions for clean tempdir teardown
+        let _ = fs::set_permissions(&rec.original_path, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(&rec.vault_path, fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[test]
+fn test_9_repeated_startup_recovery_after_each_interrupted_deletion_stage() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    // Stage 1 interruption: record in Deleting, file still at vault_path
+    let f1 = tmp.path().join("stage1.bin");
+    fs::write(&f1, b"stage 1 payload").unwrap();
+    let rec1 = qm.quarantine_file(&f1, "threat 1").unwrap();
+    storage
+        .update_quarantine_status(rec1.id, QuarantineStatus::Deleting, None)
+        .unwrap();
+
+    // Stage 2 interruption: record in Deleting, file moved to .deleting_<id>.locked
+    let f2 = tmp.path().join("stage2.bin");
+    fs::write(&f2, b"stage 2 payload").unwrap();
+    let rec2 = qm.quarantine_file(&f2, "threat 2").unwrap();
+    let del2_path = vault_dir.join(format!(".deleting_{}.locked", rec2.id));
+    fs::rename(&rec2.vault_path, &del2_path).unwrap();
+    storage
+        .update_quarantine_status(rec2.id, QuarantineStatus::Deleting, None)
+        .unwrap();
+
+    // Stage 3 interruption: record in Deleted, file still at .deleting_<id>.locked
+    let f3 = tmp.path().join("stage3.bin");
+    fs::write(&f3, b"stage 3 payload").unwrap();
+    let rec3 = qm.quarantine_file(&f3, "threat 3").unwrap();
+    let del3_path = vault_dir.join(format!(".deleting_{}.locked", rec3.id));
+    fs::rename(&rec3.vault_path, &del3_path).unwrap();
+    storage
+        .update_quarantine_status(rec3.id, QuarantineStatus::Deleted, None)
+        .unwrap();
+
+    // 1st recovery run:
+    let r1 = qm.recover_on_startup().unwrap();
+    assert!(r1.recovered_to_quarantine.contains(&rec1.id));
+    assert!(r1.recovered_to_quarantine.contains(&rec2.id));
+    assert!(r1.finalized_deletions.contains(&rec3.id));
+
+    // Verify SQLite states
+    assert_eq!(
+        storage.get_quarantine(rec1.id).unwrap().status,
+        QuarantineStatus::Quarantined
+    );
+    assert_eq!(
+        storage.get_quarantine(rec2.id).unwrap().status,
+        QuarantineStatus::Quarantined
+    );
+    assert_eq!(
+        storage.get_quarantine(rec3.id).unwrap().status,
+        QuarantineStatus::Deleted
+    );
+
+    // Verify Filesystem
+    assert!(Path::new(&rec1.vault_path).exists());
+    assert!(Path::new(&rec2.vault_path).exists());
+    assert!(!del2_path.exists());
+    assert!(!del3_path.exists());
+
+    // 2nd recovery run (idempotency):
+    let r2 = qm.recover_on_startup().unwrap();
+    assert!(r2.recovered_to_quarantine.is_empty());
+    assert!(r2.finalized_deletions.is_empty());
+    assert!(r2.recovery_failures.is_empty());
+
+    // 3rd recovery run (repeated idempotency):
+    let r3 = qm.recover_on_startup().unwrap();
+    assert!(r3.recovered_to_quarantine.is_empty());
+    assert!(r3.finalized_deletions.is_empty());
+    assert!(r3.recovery_failures.is_empty());
 }
