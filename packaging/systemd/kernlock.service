@@ -1,0 +1,25 @@
+[Unit]
+Description=KernLock Endpoint Security Daemon (Detect. Block. Explain.)
+Documentation=https://github.com/Muneebkhan369/kernlock
+After=network.target local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/kernlock serve --data-dir /var/lib/kernlock
+Restart=always
+RestartSec=5s
+
+# Linux kernel capabilities required for fanotify pre-execution blocking & process telemetry
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+
+# System hardening
+LimitNOFILE=65536
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

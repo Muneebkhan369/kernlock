@@ -5,6 +5,7 @@ use kernlock_core::{
 use std::path::Path;
 use thiserror::Error;
 
+pub mod fanotify;
 pub mod linux;
 pub mod macos;
 pub mod windows;

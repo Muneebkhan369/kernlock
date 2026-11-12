@@ -9,6 +9,8 @@ kernlock-core = { path = "../kernlock-core" }
 thiserror.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

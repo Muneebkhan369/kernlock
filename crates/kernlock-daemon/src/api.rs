@@ -27,6 +27,7 @@ struct StatusResponse {
     capabilities: kernlock_core::PlatformCapabilities,
     policy: PolicyConfig,
     watcher_active: bool,
+    fanotify_active: bool,
     rules_loaded: usize,
 }
 
@@ -212,6 +213,7 @@ async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
         capabilities,
         policy,
         watcher_active: state.engine.is_watcher_active(),
+        fanotify_active: state.engine.is_fanotify_active(),
         rules_loaded: state.engine.rules.rule_count(),
     })
 }

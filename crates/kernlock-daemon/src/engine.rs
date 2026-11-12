@@ -6,7 +6,7 @@ use kernlock_core::{
     PersistenceEntry, PlatformCapabilities, PolicyConfig, ProcessInfo, QuarantineRecord,
     RuleEngine, SecurityEvent, SecurityMode, SecurityReport, Severity, ThreatAlert,
 };
-use kernlock_platform::{default_provider, PlatformSecurityProvider};
+use kernlock_platform::{default_provider, fanotify::FanotifyPermissionMonitor, PlatformSecurityProvider};
 use kernlock_quarantine::QuarantineManager;
 use kernlock_storage::Storage;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -24,6 +24,7 @@ pub struct KernLockEngine {
     pub provider: Arc<Box<dyn PlatformSecurityProvider>>,
     pub scanner: ScanManager,
     watcher_active: Arc<Mutex<bool>>,
+    fanotify_monitor: Arc<Mutex<Option<FanotifyPermissionMonitor>>>,
 }
 
 impl KernLockEngine {
@@ -63,6 +64,7 @@ impl KernLockEngine {
             provider,
             scanner,
             watcher_active: Arc::new(Mutex::new(false)),
+            fanotify_monitor: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -76,6 +78,49 @@ impl KernLockEngine {
             .watcher_active
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn is_fanotify_active(&self) -> bool {
+        if let Ok(guard) = self.fanotify_monitor.lock() {
+            guard.as_ref().map(|m| m.is_running()).unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    pub fn start_fanotify_monitor(&self) {
+        if !FanotifyPermissionMonitor::is_supported() {
+            info!("fanotify is not supported on this host/environment; skipping kernel permission monitor");
+            return;
+        }
+
+        match FanotifyPermissionMonitor::init() {
+            Ok(monitor) => {
+                let engine = self.clone();
+                let vault_dir = engine.quarantine.vault_dir().to_path_buf();
+                let rules = engine.rules.clone();
+                let engine_for_policy = engine.clone();
+                let policy_provider = Arc::new(move || engine_for_policy.get_policy().unwrap_or_default());
+
+                monitor.start(
+                    vault_dir,
+                    policy_provider,
+                    rules,
+                    move |event, alert| {
+                        let _ = engine.storage.insert_event(&event);
+                        let _ = engine.storage.insert_alert(&alert);
+                    },
+                );
+
+                if let Ok(mut guard) = self.fanotify_monitor.lock() {
+                    *guard = Some(monitor);
+                }
+                info!("fanotify kernel permission monitor active");
+            }
+            Err(e) => {
+                warn!("Unable to initialize fanotify permission monitor: {}", e);
+            }
+        }
     }
 
     pub fn get_policy(&self) -> Result<PolicyConfig> {

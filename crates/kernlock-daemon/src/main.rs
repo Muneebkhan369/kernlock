@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Serve { port, ui_dir } => {
             let api_token = auth::load_or_create_token(&data_dir)?;
+            engine.start_fanotify_monitor();
             engine.start_realtime_watcher();
             let app = api::build_router(engine, api_token, ui_dir);
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
