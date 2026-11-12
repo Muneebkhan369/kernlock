@@ -147,4 +147,48 @@ fn test_raw_c_matching_minifilter_request_verdict_evaluation() {
     assert_eq!(verdict, ExecutionVerdict::Block as u32);
     assert_eq!(ntstatus, STATUS_ACCESS_DENIED);
     assert_eq!(threat_count.load(Ordering::SeqCst), 1);
+
+    // 2. Unreadable / non-existent file in Strict mode must fail-closed (Block / STATUS_ACCESS_DENIED)
+    let non_existent_path = tmp.path().join("missing.exe");
+    let non_existent_str = non_existent_path.to_string_lossy().to_string();
+    let mut missing_path_utf16 = [0u16; 1024];
+    for (i, c) in non_existent_str.encode_utf16().enumerate() {
+        if i < 1023 {
+            missing_path_utf16[i] = c;
+        }
+    }
+    let missing_req = RawExecutionRequestMsg {
+        header: RawMinifilterMsgHeader {
+            message_id: 6666,
+            process_id: 1234,
+            thread_id: 5678,
+            timestamp: 999999,
+        },
+        desired_access: 0x0000_0020,
+        parent_process_id: 4,
+        file_path: missing_path_utf16,
+    };
+
+    let strict_policy = PolicyConfig {
+        mode: SecurityMode::Strict,
+        ..Default::default()
+    };
+    let missing_strict_resp =
+        client.evaluate_request(&missing_req, &rules, &strict_policy, &on_threat);
+    let missing_strict_verdict = missing_strict_resp.verdict;
+    let missing_strict_ntstatus = missing_strict_resp.ntstatus;
+    assert_eq!(missing_strict_verdict, ExecutionVerdict::Block as u32);
+    assert_eq!(missing_strict_ntstatus, STATUS_ACCESS_DENIED);
+
+    // 3. Unreadable / non-existent file in Protection mode must fail-open (Allow / STATUS_SUCCESS)
+    let protection_policy = PolicyConfig {
+        mode: SecurityMode::Protection,
+        ..Default::default()
+    };
+    let missing_protection_resp =
+        client.evaluate_request(&missing_req, &rules, &protection_policy, &on_threat);
+    let missing_prot_verdict = missing_protection_resp.verdict;
+    let missing_prot_ntstatus = missing_protection_resp.ntstatus;
+    assert_eq!(missing_prot_verdict, ExecutionVerdict::Allow as u32);
+    assert_eq!(missing_prot_ntstatus, STATUS_SUCCESS);
 }

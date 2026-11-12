@@ -309,85 +309,115 @@ impl MinifilterClient {
         }
 
         // Perform bounded streaming file content inspection if accessible
-        let is_threat = if path.is_file() {
-            if let Ok(mut file) = fs::File::open(&path) {
-                if let Ok(res) = kernlock_core::analyzer::scan_stream_reader(
-                    &mut file,
-                    &file_path_str,
-                    rules,
-                    policy,
-                ) {
-                    if res.is_suspicious || res.risk_score >= policy.auto_quarantine_threshold {
-                        let event = SecurityEvent {
-                            id: Uuid::new_v4(),
-                            timestamp: chrono::Utc::now(),
-                            category: EventCategory::Process,
-                            severity: res.severity,
-                            title: format!(
-                                "Execution Blocked: {}",
-                                res.threat_name
-                                    .as_deref()
-                                    .unwrap_or("Malicious Windows Executable")
-                            ),
-                            description: format!(
-                                "Windows Minifilter intercepted execution of {} by PID {}",
-                                file_path_str, pid
-                            ),
-                            target: file_path_str.clone(),
-                            risk_score: res.risk_score,
-                            action_taken: "KernelExecutionBlocked".to_string(),
-                            rule_ids: res.matches.iter().map(|m| m.rule_id.clone()).collect(),
-                            metadata: serde_json::json!({
-                                "pid": pid,
-                                "parent_pid": parent_pid,
-                                "sha256": res.sha256,
-                                "threat_name": res.threat_name,
-                                "altitude": KERNLOCK_FILTER_ALTITUDE,
-                            }),
-                        };
+        // Perform bounded streaming file content inspection if accessible
+        let scan_outcome = (|| -> Result<kernlock_core::models::FileScanResult, String> {
+            #[cfg(target_os = "windows")]
+            let mut file = {
+                use std::os::windows::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(7) // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                    .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS
+                    .open(&path)
+                    .map_err(|e| format!("Failed to open file: {}", e))?
+            };
+            #[cfg(not(target_os = "windows"))]
+            let mut file =
+                fs::File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
 
-                        let alert = ThreatAlert {
-                            id: Uuid::new_v4(),
-                            event_id: event.id,
-                            timestamp: event.timestamp,
-                            severity: res.severity,
-                            title: event.title.clone(),
-                            explanation: res.summary.clone(),
-                            target: file_path_str.clone(),
-                            risk_score: res.risk_score,
-                            status: AlertStatus::Open,
-                            recommended_action: "Execution was blocked via Filter Manager (FLTMGR). Quarantine binary and inspect process lineage.".to_string(),
-                        };
-
-                        on_threat(event, alert);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("Failed to read metadata: {}", e))?;
+            if !meta.is_file() {
+                return Err("Target is not a regular file".to_string());
             }
-        } else {
-            false
-        };
 
-        if is_threat {
-            RawExecutionResponseMsg::new(
-                message_id,
-                ExecutionVerdict::Block,
-                STATUS_ACCESS_DENIED,
-                "Execution blocked by KernLock detection rules",
-            )
-        } else {
-            RawExecutionResponseMsg::new(
-                message_id,
-                ExecutionVerdict::Allow,
-                STATUS_SUCCESS,
-                "Clean executable verified",
-            )
+            kernlock_core::analyzer::scan_stream_reader(&mut file, &file_path_str, rules, policy)
+                .map_err(|e| format!("Scan error: {}", e))
+        })();
+
+        match scan_outcome {
+            Ok(res) => {
+                if res.is_suspicious || res.risk_score >= policy.auto_quarantine_threshold {
+                    let event = SecurityEvent {
+                        id: Uuid::new_v4(),
+                        timestamp: chrono::Utc::now(),
+                        category: EventCategory::Process,
+                        severity: res.severity,
+                        title: format!(
+                            "Execution Blocked: {}",
+                            res.threat_name
+                                .as_deref()
+                                .unwrap_or("Malicious Windows Executable")
+                        ),
+                        description: format!(
+                            "Windows Minifilter intercepted execution of {} by PID {}",
+                            file_path_str, pid
+                        ),
+                        target: file_path_str.clone(),
+                        risk_score: res.risk_score,
+                        action_taken: "KernelExecutionBlocked".to_string(),
+                        rule_ids: res.matches.iter().map(|m| m.rule_id.clone()).collect(),
+                        metadata: serde_json::json!({
+                            "pid": pid,
+                            "parent_pid": parent_pid,
+                            "sha256": res.sha256,
+                            "threat_name": res.threat_name,
+                            "altitude": KERNLOCK_FILTER_ALTITUDE,
+                        }),
+                    };
+
+                    let alert = ThreatAlert {
+                        id: Uuid::new_v4(),
+                        event_id: event.id,
+                        timestamp: event.timestamp,
+                        severity: res.severity,
+                        title: event.title.clone(),
+                        explanation: res.summary.clone(),
+                        target: file_path_str.clone(),
+                        risk_score: res.risk_score,
+                        status: AlertStatus::Open,
+                        recommended_action: "Execution was blocked via Filter Manager (FLTMGR). Quarantine binary and inspect process lineage.".to_string(),
+                    };
+
+                    on_threat(event, alert);
+
+                    RawExecutionResponseMsg::new(
+                        message_id,
+                        ExecutionVerdict::Block,
+                        STATUS_ACCESS_DENIED,
+                        "Execution blocked by KernLock detection rules",
+                    )
+                } else {
+                    RawExecutionResponseMsg::new(
+                        message_id,
+                        ExecutionVerdict::Allow,
+                        STATUS_SUCCESS,
+                        "Clean executable verified",
+                    )
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Windows Minifilter scan error for {}: {}", file_path_str, e);
+                // Never silently evaluate unreadable files or scanner errors to clean:
+                // Strict mode fails closed (Block / STATUS_ACCESS_DENIED)
+                // Protection mode fails open (Allow / STATUS_SUCCESS)
+                if policy.mode == SecurityMode::Strict {
+                    RawExecutionResponseMsg::new(
+                        message_id,
+                        ExecutionVerdict::Block,
+                        STATUS_ACCESS_DENIED,
+                        "Scan error or unreadable file in Strict mode (fail-closed)",
+                    )
+                } else {
+                    RawExecutionResponseMsg::new(
+                        message_id,
+                        ExecutionVerdict::Allow,
+                        STATUS_SUCCESS,
+                        "Scan error or unreadable file in Protection mode (fail-open)",
+                    )
+                }
+            }
         }
     }
 

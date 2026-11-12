@@ -12,6 +12,13 @@ pub enum RuleError {
         rule_id: String,
         source: regex::Error,
     },
+    #[error("Invalid rule definition {rule_id}: {reason}")]
+    InvalidRule { rule_id: String, reason: String },
+    #[error("Invalid signature {signature_id}: {reason}")]
+    InvalidSignature {
+        signature_id: String,
+        reason: String,
+    },
     #[error("I/O error reading rules: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -102,6 +109,95 @@ impl RuleEngine {
             rules: Arc::new(RwLock::new(compiled)),
             signatures: Arc::new(RwLock::new(DynamicSignatures::default())),
         })
+    }
+
+    pub fn validate_manifest(
+        manifest: &crate::intelligence::ThreatBundleManifest,
+    ) -> Result<(), RuleError> {
+        if crate::intelligence::parse_version_tuple(&manifest.version).is_empty() {
+            return Err(RuleError::InvalidRule {
+                rule_id: "manifest".to_string(),
+                reason: format!("Invalid manifest version format: '{}'", manifest.version),
+            });
+        }
+        if manifest.timestamp.timestamp() <= 0 {
+            return Err(RuleError::InvalidRule {
+                rule_id: "manifest".to_string(),
+                reason: "Manifest timestamp cannot be zero or negative".to_string(),
+            });
+        }
+
+        // Validate and compile rules
+        for def in &manifest.rules {
+            if def.id.trim().is_empty() {
+                return Err(RuleError::InvalidRule {
+                    rule_id: "<unnamed>".to_string(),
+                    reason: "Rule ID cannot be empty".to_string(),
+                });
+            }
+            let pattern = if def.case_insensitive {
+                format!("(?i){}", def.pattern)
+            } else {
+                def.pattern.clone()
+            };
+            Regex::new(&pattern).map_err(|source| RuleError::Regex {
+                rule_id: def.id.clone(),
+                source,
+            })?;
+        }
+
+        // Validate hash signatures
+        for hash in &manifest.hash_signatures {
+            let sig_id = if !hash.threat_name.trim().is_empty() {
+                hash.threat_name.clone()
+            } else {
+                hash.sha256.clone()
+            };
+            if hash.threat_name.trim().is_empty() {
+                return Err(RuleError::InvalidSignature {
+                    signature_id: sig_id,
+                    reason: "Hash signature threat_name cannot be empty".to_string(),
+                });
+            }
+            if hash.sha256.len() != 64 || hex::decode(&hash.sha256).is_err() {
+                return Err(RuleError::InvalidSignature {
+                    signature_id: sig_id,
+                    reason: format!("Invalid SHA-256 hex string: '{}'", hash.sha256),
+                });
+            }
+        }
+
+        // Validate byte signatures
+        for byte_sig in &manifest.byte_signatures {
+            if byte_sig.id.trim().is_empty() {
+                return Err(RuleError::InvalidSignature {
+                    signature_id: "<unnamed>".to_string(),
+                    reason: "Byte signature ID cannot be empty".to_string(),
+                });
+            }
+            if byte_sig.pattern_hex.trim().is_empty() {
+                return Err(RuleError::InvalidSignature {
+                    signature_id: byte_sig.id.clone(),
+                    reason: "Byte signature pattern_hex cannot be empty".to_string(),
+                });
+            }
+            let bytes =
+                hex::decode(&byte_sig.pattern_hex).map_err(|_| RuleError::InvalidSignature {
+                    signature_id: byte_sig.id.clone(),
+                    reason: format!(
+                        "Invalid hex pattern in byte signature '{}'",
+                        byte_sig.pattern_hex
+                    ),
+                })?;
+            if bytes.is_empty() {
+                return Err(RuleError::InvalidSignature {
+                    signature_id: byte_sig.id.clone(),
+                    reason: "Byte signature decoded bytes cannot be empty".to_string(),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     pub fn replace_rules(&self, new_defs: Vec<DetectionRuleDef>) -> Result<(), RuleError> {

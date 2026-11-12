@@ -1,0 +1,102 @@
+name: KernLock CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-build-and-test:
+    name: Linux (Ubuntu) Test, Lint, UI & Package Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check code formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace --verbose
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Verify desktop sidecar and build frontend
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run test:sidecar
+          npm run build
+
+      - name: Build Debian release package
+        run: |
+          chmod +x scripts/package-deb.sh
+          ./scripts/package-deb.sh
+          ls -lh target/debian/*.deb
+
+  windows-build-and-test:
+    name: Windows Test & Minifilter Driver Build
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Windows platform and core tests
+        run: cargo test -p kernlock-core -p kernlock-storage -p kernlock-quarantine -p kernlock-platform --test windows_tests
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Inspect Minifilter Driver project syntax
+        shell: pwsh
+        run: |
+          Test-Path crates/kernlock-platform/driver/windows/kernlock_filter.vcxproj
+          Test-Path crates/kernlock-platform/driver/windows/kernlock_filter.c
+          Test-Path crates/kernlock-platform/driver/windows/kernlock_filter.h
+
+  macos-build-and-test:
+    name: macOS Test & Endpoint Security Client Verification
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run macOS platform and core tests
+        run: cargo test -p kernlock-core -p kernlock-storage -p kernlock-quarantine -p kernlock-platform --test macos_tests
+
+      - name: Compile Apple EndpointSecurity C Client
+        run: |
+          clang -Wall -Wextra -Werror \
+            -framework EndpointSecurity -framework Foundation \
+            crates/kernlock-platform/extension/macos/main.c \
+            -o target/kernlock_es_client -c

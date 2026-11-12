@@ -80,36 +80,68 @@ impl KernLockEngine {
         let mut hash_count = 5;
         let mut byte_count = 5;
 
-        if let Ok(Some(persisted_bundle)) = storage.load_threat_bundle() {
-            let mut is_valid = false;
-            let current_trusted = trusted_keys.read().unwrap();
-            for trusted in current_trusted.iter() {
-                if persisted_bundle.verify_with_hex_key(trusted).is_ok() {
-                    is_valid = true;
-                    break;
+        match storage.load_threat_bundle() {
+            Ok(Some(persisted_bundle)) => {
+                let mut is_valid = false;
+                let current_trusted = trusted_keys.read().unwrap();
+                for trusted in current_trusted.iter() {
+                    if persisted_bundle.verify_with_hex_key(trusted).is_ok() {
+                        is_valid = true;
+                        break;
+                    }
+                }
+                drop(current_trusted);
+
+                if is_valid {
+                    // Fully validate manifest (rules, regexes, hashes, byte patterns) before activation
+                    match RuleEngine::validate_manifest(&persisted_bundle.manifest) {
+                        Ok(()) => {
+                            let new_rules = persisted_bundle.manifest.rules;
+                            let new_hashes = persisted_bundle.manifest.hash_signatures;
+                            let new_bytes = persisted_bundle.manifest.byte_signatures;
+
+                            let _rule_count = new_rules.len();
+                            let h_count = new_hashes.len();
+                            let b_count = new_bytes.len();
+
+                            if let Err(e) =
+                                rules.replace_definitions(new_rules, new_hashes, new_bytes)
+                            {
+                                warn!(
+                                    "Failed to activate persisted rules: {}; retaining built-in baseline",
+                                    e
+                                );
+                            } else {
+                                info!(
+                                    "Restoring persisted threat definitions v{} (timestamp {})",
+                                    persisted_bundle.manifest.version,
+                                    persisted_bundle.manifest.timestamp
+                                );
+                                initial_version = persisted_bundle.manifest.version;
+                                initial_timestamp = persisted_bundle.manifest.timestamp;
+                                hash_count = h_count;
+                                byte_count = b_count;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Persisted threat bundle failed validation on startup: {}; retaining built-in baseline",
+                                e
+                            );
+                        }
+                    }
+                } else {
+                    warn!(
+                        "Persisted threat bundle failed signature verification against trusted keys; retaining built-in baseline"
+                    );
                 }
             }
-            drop(current_trusted);
-
-            if is_valid {
-                info!(
-                    "Restoring persisted threat definitions v{} (timestamp {})",
-                    persisted_bundle.manifest.version, persisted_bundle.manifest.timestamp
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    "Failed to read persisted threat definitions from storage: {}; retaining built-in baseline",
+                    e
                 );
-                initial_version = persisted_bundle.manifest.version.clone();
-                initial_timestamp = persisted_bundle.manifest.timestamp;
-                hash_count = persisted_bundle.manifest.hash_signatures.len();
-                byte_count = persisted_bundle.manifest.byte_signatures.len();
-
-                if let Err(e) = rules.replace_definitions(
-                    persisted_bundle.manifest.rules,
-                    persisted_bundle.manifest.hash_signatures,
-                    persisted_bundle.manifest.byte_signatures,
-                ) {
-                    warn!("Failed to activate persisted rules: {}", e);
-                }
-            } else {
-                warn!("Persisted threat bundle failed signature verification against trusted keys; reverting to baseline");
             }
         }
 
@@ -202,12 +234,16 @@ impl KernLockEngine {
         )
         .map_err(|e| anyhow::anyhow!("Version rollback rejected: {}", e))?;
 
-        // 3. Persist bundle to database BEFORE activating in-memory (transactional guarantee)
+        // 3. TRANSACTIONAL INTEGRITY: Validate and compile EVERY definition before persisting to database
+        RuleEngine::validate_manifest(&bundle.manifest)
+            .map_err(|e| anyhow::anyhow!("Invalid definition in signed bundle: {}", e))?;
+
+        // 4. Persist verified bundle to database atomically BEFORE activating in-memory
         self.storage.save_threat_bundle(&bundle).map_err(|e| {
             anyhow::anyhow!("Failed to persist threat definitions to database: {}", e)
         })?;
 
-        // 4. Atomically replace rules AND dynamic hash/byte signatures in scanner engine
+        // 5. Atomically replace rules AND dynamic hash/byte signatures in scanner engine
         let new_rule_count = bundle.manifest.rules.len();
         let new_hash_count = bundle.manifest.hash_signatures.len();
         let new_byte_count = bundle.manifest.byte_signatures.len();
@@ -218,9 +254,11 @@ impl KernLockEngine {
                 bundle.manifest.hash_signatures,
                 bundle.manifest.byte_signatures,
             )
-            .map_err(|e| anyhow::anyhow!("Failed to compile updated threat definitions: {}", e))?;
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to activate validated threat definitions: {}", e)
+            })?;
 
-        // 5. Update cached status only after atomic replacement succeeds
+        // 6. Update cached status only after atomic replacement succeeds
         let mut status = self
             .definitions_status
             .lock()
@@ -395,8 +433,14 @@ impl KernLockEngine {
 
                         return true; // BLOCKED
                     }
+                } else if policy.mode == SecurityMode::Strict {
+                    return true;
                 }
+            } else if policy.mode == SecurityMode::Strict {
+                return true;
             }
+        } else if policy.mode == SecurityMode::Strict {
+            return true;
         }
 
         false // ALLOWED
@@ -445,6 +489,21 @@ impl KernLockEngine {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        // Validate peer credentials if available on Linux
+                        #[cfg(target_os = "linux")]
+                        if let Ok(ucred) = stream.peer_cred() {
+                            let peer_uid = ucred.uid();
+                            let self_uid = unsafe { libc::geteuid() };
+                            // Accept connections from root (0) or self process UID
+                            if peer_uid != 0 && peer_uid != self_uid {
+                                warn!(
+                                    "Rejected unauthorized Unix domain socket connection from UID {}",
+                                    peer_uid
+                                );
+                                continue;
+                            }
+                        }
+
                         let eng = engine.clone();
                         tokio::spawn(async move {
                             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -455,6 +514,14 @@ impl KernLockEngine {
                                 let trimmed = line.trim();
                                 if trimmed.is_empty() {
                                     continue;
+                                }
+
+                                if trimmed.len() > 4096 {
+                                    let _ = writer
+                                        .write_all(b"{\"error\":\"frame_too_large\"}\n")
+                                        .await;
+                                    let _ = writer.flush().await;
+                                    break;
                                 }
 
                                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
@@ -471,12 +538,25 @@ impl KernLockEngine {
                                             .and_then(|v| v.as_bool())
                                             .unwrap_or(false);
 
+                                        let policy = eng.get_policy().unwrap_or_default();
+                                        let mode_str = match policy.mode {
+                                            SecurityMode::Audit => "audit",
+                                            SecurityMode::Protection => "protection",
+                                            SecurityMode::Strict => "strict",
+                                        };
+
                                         let blocked = eng
                                             .evaluate_authorization_request(path_str, pid, is_exec);
                                         let resp = if blocked {
-                                            "{\"verdict\":\"block\"}\n"
+                                            format!(
+                                                "{{\"verdict\":\"block\",\"mode\":\"{}\"}}\n",
+                                                mode_str
+                                            )
                                         } else {
-                                            "{\"verdict\":\"allow\"}\n"
+                                            format!(
+                                                "{{\"verdict\":\"allow\",\"mode\":\"{}\"}}\n",
+                                                mode_str
+                                            )
                                         };
                                         let _ = writer.write_all(resp.as_bytes()).await;
                                         let _ = writer.flush().await;

@@ -29,6 +29,35 @@ typedef enum {
 static es_client_t *g_client = NULL;
 static kernlock_mode_t g_current_mode = MODE_PROTECTION;
 
+static void json_escape(const char *src, char *dest, size_t dest_size) {
+    if (!src || !dest || dest_size == 0) return;
+    size_t d = 0;
+    for (size_t s = 0; src[s] != '\0' && d + 6 < dest_size; s++) {
+        unsigned char c = (unsigned char)src[s];
+        if (c == '"') {
+            dest[d++] = '\\';
+            dest[d++] = '"';
+        } else if (c == '\\') {
+            dest[d++] = '\\';
+            dest[d++] = '\\';
+        } else if (c == '\n') {
+            dest[d++] = '\\';
+            dest[d++] = 'n';
+        } else if (c == '\r') {
+            dest[d++] = '\\';
+            dest[d++] = 'r';
+        } else if (c == '\t') {
+            dest[d++] = '\\';
+            dest[d++] = 't';
+        } else if (c < 32) {
+            d += (size_t)snprintf(&dest[d], dest_size - d, "\\u%04x", c);
+        } else {
+            dest[d++] = (char)c;
+        }
+    }
+    dest[d] = '\0';
+}
+
 /**
  * Length-safe extraction of es_string_token_t into a null-terminated buffer.
  * Note: es_string_token_t.data is NOT guaranteed to be null-terminated by ESF.
@@ -73,11 +102,15 @@ static int query_daemon_verdict(const char *path, pid_t pid, pid_t ppid, int is_
         return -1;
     }
 
-    // Format query JSON
+    // Escape path safely into JSON string
+    char escaped_path[1024];
+    json_escape(path, escaped_path, sizeof(escaped_path));
+
+    // Format bounded query JSON (max 2048 bytes)
     char request_json[2048];
     snprintf(request_json, sizeof(request_json),
              "{\"action\":\"eval_es\",\"path\":\"%s\",\"pid\":%d,\"ppid\":%d,\"is_exec\":%s}\n",
-             path, pid, ppid, is_exec ? "true" : "false");
+             escaped_path, pid, ppid, is_exec ? "true" : "false");
 
     if (write(sock, request_json, strlen(request_json)) <= 0) {
         close(sock);
@@ -93,6 +126,16 @@ static int query_daemon_verdict(const char *path, pid_t pid, pid_t ppid, int is_
     }
 
     response_buf[bytes_read] = '\0';
+
+    // Synchronize current mode with daemon response
+    if (strstr(response_buf, "\"mode\":\"strict\"") != NULL) {
+        g_current_mode = MODE_STRICT;
+    } else if (strstr(response_buf, "\"mode\":\"protection\"") != NULL) {
+        g_current_mode = MODE_PROTECTION;
+    } else if (strstr(response_buf, "\"mode\":\"audit\"") != NULL) {
+        g_current_mode = MODE_AUDIT;
+    }
+
     if (strstr(response_buf, "\"verdict\":\"block\"") != NULL ||
         strstr(response_buf, "\"verdict\":\"deny\"") != NULL) {
         return 1;

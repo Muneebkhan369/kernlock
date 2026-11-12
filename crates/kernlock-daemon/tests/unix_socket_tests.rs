@@ -90,5 +90,23 @@ mod unix_tests {
             "Expected block for malicious script, got: {}",
             resp2
         );
+        assert!(
+            resp2.contains("\"mode\":\"protection\""),
+            "Expected mode: protection in response, got: {}",
+            resp2
+        );
+
+        // 3. Test oversized frame rejected
+        let huge_padding = "a".repeat(5000);
+        let huge_req = format!("{{\"action\":\"eval_es\",\"path\":\"{}\"}}\n", huge_padding);
+        writer.write_all(huge_req.as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let resp3 = lines.next_line().await.unwrap().unwrap();
+        assert!(
+            resp3.contains("\"error\":\"frame_too_large\""),
+            "Expected frame_too_large for >4KB message, got: {}",
+            resp3
+        );
     }
 }

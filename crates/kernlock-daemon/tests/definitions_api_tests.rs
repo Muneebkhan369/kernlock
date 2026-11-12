@@ -320,3 +320,127 @@ async fn test_concurrent_update_races_and_failed_recovery() {
     // Current version must be preserved intact
     assert_eq!(engine.definition_status().version, final_status.version);
 }
+
+#[tokio::test]
+async fn test_update_definitions_transactional_validation_rejection() {
+    let tmp = TempDir::new().unwrap();
+    let engine = KernLockEngine::init(tmp.path()).unwrap();
+    let token = auth::load_or_create_token(tmp.path()).unwrap();
+
+    let trusted_seed = [11u8; 32];
+    let trusted_signing_key = SigningKey::from_bytes(&trusted_seed);
+    let trusted_pub_hex = hex::encode(trusted_signing_key.verifying_key().to_bytes());
+    engine.add_trusted_key_hex(&trusted_pub_hex);
+
+    let app = api::build_router(engine.clone(), token.clone(), None);
+
+    // 1. Invalid regex pattern in rule definition
+    let invalid_regex_manifest = ThreatBundleManifest {
+        version: "2026.11.12.110".to_string(),
+        timestamp: Utc::now() + Duration::hours(1),
+        rules: vec![DetectionRuleDef {
+            id: "KL-INVALID-REGEX".to_string(),
+            name: "Invalid Regex Rule".to_string(),
+            target: RuleTarget::Command,
+            category: EventCategory::Command,
+            severity: Severity::Critical,
+            score: 99,
+            case_insensitive: false,
+            pattern: "(?P<unclosed_regex".to_string(),
+            explanation: "Invalid regex syntax".to_string(),
+            remediation: "None".to_string(),
+            tags: vec![],
+        }],
+        hash_signatures: vec![],
+        byte_signatures: vec![],
+    };
+    let bundle = SignedThreatBundle::new(invalid_regex_manifest, &trusted_signing_key).unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/definitions/update")
+                .header(header::HOST, "127.0.0.1:17420")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&bundle).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Baseline version must be unchanged
+    assert_eq!(
+        engine.definition_status().version,
+        kernlock_core::BUILTIN_BASELINE_VERSION
+    );
+
+    // Storage must NOT contain the invalid bundle
+    let storage = kernlock_storage::Storage::open(tmp.path().join("kernlock.db")).unwrap();
+    assert!(storage.load_threat_bundle().unwrap().is_none());
+
+    // 2. Invalid byte signature hex
+    let invalid_byte_manifest = ThreatBundleManifest {
+        version: "2026.11.12.120".to_string(),
+        timestamp: Utc::now() + Duration::hours(2),
+        rules: vec![],
+        hash_signatures: vec![],
+        byte_signatures: vec![BundleByteSignature {
+            id: "KL-BAD-HEX".to_string(),
+            pattern_hex: "NOT_VALID_HEX!".to_string(),
+            threat_name: "BadHex".to_string(),
+            severity: Severity::High,
+            risk_score: 80,
+        }],
+    };
+    let bundle2 = SignedThreatBundle::new(invalid_byte_manifest, &trusted_signing_key).unwrap();
+
+    let resp2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/definitions/update")
+                .header(header::HOST, "127.0.0.1:17420")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&bundle2).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        engine.definition_status().version,
+        kernlock_core::BUILTIN_BASELINE_VERSION
+    );
+    assert!(storage.load_threat_bundle().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_startup_recovery_with_corrupt_database_bundle_falls_back_to_baseline() {
+    let tmp = TempDir::new().unwrap();
+
+    // 1. Manually insert corrupt JSON into SQLite
+    {
+        let _storage = kernlock_storage::Storage::open(tmp.path().join("kernlock.db")).unwrap();
+        // Insert corrupt JSON directly into threat_definitions table
+        let conn = rusqlite::Connection::open(tmp.path().join("kernlock.db")).unwrap();
+        conn.execute(
+            "INSERT INTO threat_definitions (id, version, updated_at, bundle_json)
+             VALUES (1, '9999.99.99', '2099-01-01T00:00:00Z', '{ \"corrupted\": json_broken')",
+            [],
+        )
+        .unwrap();
+    }
+
+    // 2. Start engine - it must handle corrupt database gracefully and fallback to baseline
+    let engine = KernLockEngine::init(tmp.path()).unwrap();
+    let status = engine.definition_status();
+    assert_eq!(status.version, kernlock_core::BUILTIN_BASELINE_VERSION);
+    assert!(status.rule_count > 0);
+}

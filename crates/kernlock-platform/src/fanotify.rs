@@ -274,6 +274,11 @@ impl FanotifyPermissionMonitor {
 
     #[cfg(target_os = "linux")]
     pub fn init() -> Result<Self, String> {
+        Self::init_with_target(None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn init_with_target(target: Option<&Path>) -> Result<Self, String> {
         let fd = unsafe {
             libc::fanotify_init(
                 libc::FAN_CLASS_CONTENT | libc::FAN_NONBLOCK | libc::FAN_CLOEXEC,
@@ -290,17 +295,20 @@ impl FanotifyPermissionMonitor {
 
         let mut exec_supported = true;
         let mask = libc::FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM;
-        let root_c = std::ffi::CString::new("/").map_err(|e| e.to_string())?;
+        let target_path_str = target
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let target_c =
+            std::ffi::CString::new(target_path_str.as_str()).map_err(|e| e.to_string())?;
 
-        let res = unsafe {
-            libc::fanotify_mark(
-                fd,
-                libc::FAN_MARK_ADD | libc::FAN_MARK_MOUNT,
-                mask,
-                libc::AT_FDCWD,
-                root_c.as_ptr(),
-            )
+        let mark_flags = if target.is_none() {
+            libc::FAN_MARK_ADD | libc::FAN_MARK_MOUNT
+        } else {
+            libc::FAN_MARK_ADD
         };
+
+        let res =
+            unsafe { libc::fanotify_mark(fd, mark_flags, mask, libc::AT_FDCWD, target_c.as_ptr()) };
 
         if res < 0 {
             let err = std::io::Error::last_os_error();
@@ -309,26 +317,30 @@ impl FanotifyPermissionMonitor {
                 let fallback = unsafe {
                     libc::fanotify_mark(
                         fd,
-                        libc::FAN_MARK_ADD | libc::FAN_MARK_MOUNT,
+                        mark_flags,
                         libc::FAN_OPEN_PERM,
                         libc::AT_FDCWD,
-                        root_c.as_ptr(),
+                        target_c.as_ptr(),
                     )
                 };
                 if fallback < 0 {
                     unsafe { libc::close(fd) };
                     return Err(format!(
-                        "fanotify_mark mount failed: {}",
+                        "fanotify_mark failed: {}",
                         std::io::Error::last_os_error()
                     ));
                 }
             } else {
                 unsafe { libc::close(fd) };
-                return Err(format!("fanotify_mark mount failed: {}", err));
+                return Err(format!("fanotify_mark failed: {}", err));
             }
         }
 
-        let (monitored, unmonitored) = Self::discover_mounts();
+        let (monitored, unmonitored) = if target.is_none() {
+            Self::discover_mounts()
+        } else {
+            (vec![target_path_str], Vec::new())
+        };
 
         info!(
             "Fanotify kernel execution blocking monitor initialized (fd: {}, exec_blocking: {})",
@@ -345,6 +357,11 @@ impl FanotifyPermissionMonitor {
         };
         monitor.set_health(FanotifyMonitorHealth::Initialized, None);
         Ok(monitor)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn init_with_target(_target: Option<&Path>) -> Result<Self, String> {
+        Err("fanotify is only supported on Linux kernels with CAP_SYS_ADMIN".to_string())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -388,6 +405,8 @@ impl FanotifyPermissionMonitor {
         let mut retries = 0;
         const MAX_RETRIES: usize = 5;
 
+        let expected_len = std::mem::size_of::<libc::fanotify_response>() as isize;
+
         while retries < MAX_RETRIES {
             let res = unsafe {
                 libc::write(
@@ -397,8 +416,15 @@ impl FanotifyPermissionMonitor {
                 )
             };
 
-            if res >= 0 {
+            if res == expected_len {
                 return Ok(());
+            }
+
+            if res >= 0 {
+                // Partial or 0-byte write: treat as non-fatal retryable error
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(2 * (retries as u64)));
+                continue;
             }
 
             let err = std::io::Error::last_os_error();

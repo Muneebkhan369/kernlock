@@ -173,9 +173,10 @@ impl Storage {
     }
 
     pub fn save_threat_bundle(&self, bundle: &SignedThreatBundle) -> Result<(), StorageError> {
-        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        let mut conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
         let json = serde_json::to_string(bundle)?;
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO threat_definitions (id, version, updated_at, bundle_json)
              VALUES (1, ?1, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET
@@ -188,6 +189,7 @@ impl Storage {
                 json
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
