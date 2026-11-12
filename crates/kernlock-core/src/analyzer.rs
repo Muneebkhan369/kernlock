@@ -1,9 +1,17 @@
+use crate::formats::validate_binary_format;
 use crate::models::{
-    CommandAnalysisResult, EventCategory, FileScanResult, PolicyConfig, RuleMatch, Severity,
+    CommandAnalysisResult, DetectionConfidence, EventCategory, FileScanResult, PolicyConfig,
+    RuleMatch, Severity,
 };
 use crate::rules::{RuleEngine, RuleTarget};
+use crate::signatures::check_signatures;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use std::fs::OpenOptions;
+use std::io::{self, ErrorKind, Read};
+use std::path::Path;
+
+pub const DEFAULT_MAX_INSPECT_BYTES: usize = 512 * 1024;
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -136,20 +144,122 @@ pub fn analyze_command(input: &str, rules: &RuleEngine) -> CommandAnalysisResult
     }
 }
 
-/// Statically analyzes file bytes without executing the file.
-pub fn analyze_file_bytes(
-    path: &str,
-    bytes: &[u8],
+/// Streams and analyzes a file of arbitrary size with fixed memory overhead.
+///
+/// Computes whole-file SHA-256 in blocks while inspecting the initial chunk
+/// (up to `DEFAULT_MAX_INSPECT_BYTES`) for headers, entropy, and threat signatures.
+pub fn scan_file_streaming(
+    path: &Path,
     rules: &RuleEngine,
     policy: &PolicyConfig,
-) -> FileScanResult {
-    let sha256 = sha256_hex(bytes);
-    let size_bytes = bytes.len() as u64;
-    let file_type = detect_file_type(path, bytes);
-    let entropy = shannon_entropy(bytes);
+) -> io::Result<FileScanResult> {
+    let path_str = path.to_string_lossy().to_string();
 
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("Refusing to follow symbolic link: {}", path.display()),
+            ));
+        }
+    }
+
+    let mut file = opts.open(path)?;
+
+    let meta = file.metadata()?;
+    let ft = meta.file_type();
+    if !ft.is_file() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("Path is not a regular file: {}", path.display()),
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("Refusing to follow reparse point: {}", path.display()),
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+        }
+    }
+
+    // Stream SHA-256 computation in 64KB blocks, retaining first chunk for content inspection
+    let mut hasher = Sha256::new();
+    let mut inspect_buf = Vec::with_capacity(DEFAULT_MAX_INSPECT_BYTES.min(meta.len() as usize));
+    let mut read_buf = [0u8; 64 * 1024];
+    let mut total_bytes = 0u64;
+
+    loop {
+        let n = file.read(&mut read_buf)?;
+        if n == 0 {
+            break;
+        }
+        total_bytes += n as u64;
+        hasher.update(&read_buf[..n]);
+
+        if inspect_buf.len() < DEFAULT_MAX_INSPECT_BYTES {
+            let needed = (DEFAULT_MAX_INSPECT_BYTES - inspect_buf.len()).min(n);
+            inspect_buf.extend_from_slice(&read_buf[..needed]);
+        }
+    }
+
+    let sha256 = hex::encode(hasher.finalize());
+    let file_type = detect_file_type(&path_str, &inspect_buf);
+    let entropy = shannon_entropy(&inspect_buf);
+
+    evaluate_scan_details(
+        &path_str,
+        sha256,
+        total_bytes,
+        file_type,
+        entropy,
+        &inspect_buf,
+        rules,
+        policy,
+    )
+}
+
+fn evaluate_scan_details(
+    path: &str,
+    sha256: String,
+    size_bytes: u64,
+    file_type: String,
+    entropy: f64,
+    inspect_bytes: &[u8],
+    rules: &RuleEngine,
+    policy: &PolicyConfig,
+) -> io::Result<FileScanResult> {
     if is_path_excluded(path, policy) || policy.excluded_hashes.contains(&sha256) {
-        return FileScanResult {
+        return Ok(FileScanResult {
             path: path.to_string(),
             sha256,
             size_bytes,
@@ -157,18 +267,29 @@ pub fn analyze_file_bytes(
             entropy,
             risk_score: 0,
             severity: Severity::Info,
+            confidence: DetectionConfidence::Low,
             is_suspicious: false,
+            threat_name: None,
             excluded: true,
             matches: Vec::new(),
             summary: "File matches configured policy exclusion.".to_string(),
             scanned_at: Utc::now(),
-        };
+        });
     }
 
-    let mut matches = rules.evaluate(RuleTarget::FilePath, path);
+    let mut matches = Vec::new();
 
-    // Inspect text/script content statically
-    let text_lossy = String::from_utf8_lossy(bytes);
+    // 1. Signature database checks (exact hash + byte patterns, including EICAR)
+    matches.extend(check_signatures(inspect_bytes, &sha256));
+
+    // 2. Format structure validation & anomaly detection (ELF, PE, Mach-O)
+    matches.extend(validate_binary_format(path, inspect_bytes));
+
+    // 3. File path rules
+    matches.extend(rules.evaluate(RuleTarget::FilePath, path));
+
+    // 4. File content inspection (lossy UTF-8 for pattern regexes)
+    let text_lossy = String::from_utf8_lossy(inspect_bytes);
     matches.extend(rules.evaluate(RuleTarget::FileContent, &text_lossy));
 
     let lower_type = file_type.to_lowercase();
@@ -176,8 +297,7 @@ pub fn analyze_file_bytes(
         matches.extend(rules.evaluate(RuleTarget::Command, &text_lossy));
     }
 
-    // High entropy heuristic for executables (packed/encrypted payloads),
-    // intentionally avoiding false positives on compressed archives.
+    // 5. High entropy heuristic on executable binaries
     if (lower_type.contains("executable") || lower_type.contains("script"))
         && entropy > 7.35
         && size_bytes > 4096
@@ -197,7 +317,7 @@ pub fn analyze_file_bytes(
         });
     }
 
-    // Deduplicate by rule_id
+    // Deduplicate matches by rule_id
     let mut seen = std::collections::HashSet::new();
     matches.retain(|m| seen.insert(m.rule_id.clone()));
 
@@ -205,19 +325,39 @@ pub fn analyze_file_bytes(
     let severity = severity_from_score(risk_score);
     let is_suspicious = risk_score >= 45;
 
+    // Determine confidence and primary threat name
+    let has_certain_sig = matches
+        .iter()
+        .any(|m| m.rule_id.starts_with("KL-HASH-") || m.rule_id == "KL-SIG-EICAR");
+    let confidence = if has_certain_sig {
+        DetectionConfidence::Certain
+    } else if risk_score >= 80 {
+        DetectionConfidence::High
+    } else if risk_score >= 45 {
+        DetectionConfidence::Medium
+    } else {
+        DetectionConfidence::Low
+    };
+
+    let threat_name = matches
+        .iter()
+        .max_by_key(|m| m.score)
+        .map(|m| m.rule_name.clone());
+
     let summary = if matches.is_empty() {
         format!("Clean ({}, {:.2} bits/byte entropy).", file_type, entropy)
     } else {
         let names: Vec<&str> = matches.iter().map(|m| m.rule_name.as_str()).collect();
         format!(
-            "Flagged {} indicator(s): {} (risk score {}/100).",
+            "Flagged {} indicator(s): {} (risk score {}/100, confidence: {:?}).",
             matches.len(),
             names.join("; "),
-            risk_score
+            risk_score,
+            confidence
         )
     };
 
-    FileScanResult {
+    Ok(FileScanResult {
         path: path.to_string(),
         sha256,
         size_bytes,
@@ -225,10 +365,52 @@ pub fn analyze_file_bytes(
         entropy,
         risk_score,
         severity,
+        confidence,
         is_suspicious,
+        threat_name,
         excluded: false,
         matches,
         summary,
         scanned_at: Utc::now(),
-    }
+    })
+}
+
+/// Statically analyzes file bytes without executing the file.
+pub fn analyze_file_bytes(
+    path: &str,
+    bytes: &[u8],
+    rules: &RuleEngine,
+    policy: &PolicyConfig,
+) -> FileScanResult {
+    let sha256 = sha256_hex(bytes);
+    let size_bytes = bytes.len() as u64;
+    let file_type = detect_file_type(path, bytes);
+    let entropy = shannon_entropy(bytes);
+
+    evaluate_scan_details(
+        path,
+        sha256,
+        size_bytes,
+        file_type,
+        entropy,
+        bytes,
+        rules,
+        policy,
+    )
+    .unwrap_or_else(|_| FileScanResult {
+        path: path.to_string(),
+        sha256: sha256_hex(bytes),
+        size_bytes: bytes.len() as u64,
+        file_type: "Error".to_string(),
+        entropy: 0.0,
+        risk_score: 0,
+        severity: Severity::Info,
+        confidence: DetectionConfidence::Low,
+        is_suspicious: false,
+        threat_name: None,
+        excluded: false,
+        matches: Vec::new(),
+        summary: "Analysis failed".to_string(),
+        scanned_at: Utc::now(),
+    })
 }

@@ -151,7 +151,7 @@ rules:
     severity: medium
     score: 45
     case_insensitive: false
-    pattern: "^(/tmp|/dev/shm|/var/tmp)/(\\.|[a-zA-Z0-9_-]+\\.(sh|py|elf|bin|out|so)$)"
+    pattern: "^(/tmp|/dev/shm|/var/tmp)/(\\.[a-zA-Z0-9_-]+|[a-zA-Z0-9_-]+\\.(sh|py|elf|bin|out|so))$"
     explanation: "Files placed in /tmp, /dev/shm, or /var/tmp are frequently used by staging payloads and transient malware."
     remediation: "Verify the origin of the file; consider mounting /tmp and /dev/shm with noexec where compatible."
     tags: ["staging", "execution"]

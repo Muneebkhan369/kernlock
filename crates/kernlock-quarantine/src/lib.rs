@@ -188,6 +188,10 @@ impl QuarantineManager {
         })
     }
 
+    pub fn vault_dir(&self) -> &Path {
+        &self.vault_dir
+    }
+
     pub fn quarantine_file<P: AsRef<Path>>(
         &self,
         path: P,

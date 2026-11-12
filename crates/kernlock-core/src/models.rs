@@ -115,6 +115,78 @@ pub struct PersistenceEntry {
     pub matches: Vec<RuleMatch>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionConfidence {
+    Low,
+    Medium,
+    High,
+    Certain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanMode {
+    Quick,
+    Full,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanStatus {
+    Queued,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanProgress {
+    pub scan_id: Uuid,
+    pub mode: ScanMode,
+    pub status: ScanStatus,
+    pub current_path: String,
+    pub files_scanned: usize,
+    pub files_skipped: usize,
+    pub threats_found: usize,
+    pub errors_count: usize,
+    pub is_complete: bool,
+    pub is_cancelled: bool,
+    pub started_at: DateTime<Utc>,
+    pub elapsed_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanJobSummary {
+    pub id: Uuid,
+    pub mode: ScanMode,
+    pub status: ScanStatus,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub files_scanned: usize,
+    pub files_skipped: usize,
+    pub threats_found: usize,
+    pub errors_count: usize,
+    pub target_paths: Vec<String>,
+    pub threats: Vec<FileScanResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreatRecord {
+    pub id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub threat_name: String,
+    pub path: String,
+    pub sha256: String,
+    pub severity: Severity,
+    pub confidence: DetectionConfidence,
+    pub risk_score: u32,
+    pub action_taken: String,
+    pub quarantine_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileScanResult {
     pub path: String,
@@ -124,7 +196,9 @@ pub struct FileScanResult {
     pub entropy: f64,
     pub risk_score: u32,
     pub severity: Severity,
+    pub confidence: DetectionConfidence,
     pub is_suspicious: bool,
+    pub threat_name: Option<String>,
     pub excluded: bool,
     pub matches: Vec<RuleMatch>,
     pub summary: String,
@@ -166,6 +240,15 @@ impl Default for PolicyConfig {
             max_scan_file_size_mb: 100,
             updated_at: Utc::now(),
         }
+    }
+}
+
+impl PolicyConfig {
+    pub fn is_path_excluded<P: AsRef<std::path::Path>>(&self, path: P) -> bool {
+        let p_str = path.as_ref().to_string_lossy();
+        self.excluded_paths
+            .iter()
+            .any(|excl| !excl.is_empty() && p_str.starts_with(excl))
     }
 }
 

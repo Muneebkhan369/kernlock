@@ -1,3 +1,4 @@
+use crate::scanner::ScanManager;
 use anyhow::Result;
 use chrono::Utc;
 use kernlock_core::{
@@ -21,6 +22,7 @@ pub struct KernLockEngine {
     pub storage: Storage,
     pub quarantine: QuarantineManager,
     pub provider: Arc<Box<dyn PlatformSecurityProvider>>,
+    pub scanner: ScanManager,
     watcher_active: Arc<Mutex<bool>>,
 }
 
@@ -47,12 +49,19 @@ impl KernLockEngine {
         }
         let rules = Arc::new(RuleEngine::builtin());
         let provider = Arc::new(default_provider());
+        let scanner = ScanManager::new(
+            rules.clone(),
+            storage.clone(),
+            quarantine.clone(),
+            provider.clone(),
+        );
 
         Ok(Self {
             rules,
             storage,
             quarantine,
             provider,
+            scanner,
             watcher_active: Arc::new(Mutex::new(false)),
         })
     }

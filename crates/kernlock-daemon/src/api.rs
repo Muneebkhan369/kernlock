@@ -8,7 +8,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use kernlock_core::{AlertStatus, PolicyConfig};
+use kernlock_core::{AlertStatus, PolicyConfig, ScanMode, ScanStatus};
 use kernlock_platform::PlatformError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -33,6 +33,23 @@ struct StatusResponse {
 #[derive(Deserialize)]
 struct ScanPathRequest {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct StartScanRequest {
+    mode: ScanMode,
+    paths: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct StartScanResponse {
+    scan_id: Uuid,
+    status: ScanStatus,
+}
+
+#[derive(Serialize)]
+struct CancelScanResponse {
+    cancelled: bool,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +150,11 @@ pub fn build_router(
         .route("/api/processes", get(get_processes))
         .route("/api/persistence", get(get_persistence))
         .route("/api/scan/path", post(scan_path))
+        .route("/api/scan/start", post(start_scan))
+        .route("/api/scan/cancel", post(cancel_scan))
+        .route("/api/scan/current", get(get_current_scan))
+        .route("/api/scan/history", get(list_scan_history))
+        .route("/api/threats/history", get(list_threats_history))
         .route("/api/analyze/command", post(analyze_command))
         .route("/api/events", get(list_events))
         .route("/api/alerts", get(list_alerts))
@@ -228,6 +250,50 @@ async fn scan_path(
     state
         .engine
         .scan_path(&p)
+        .map(Json)
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn start_scan(
+    State(state): State<AppState>,
+    Json(req): Json<StartScanRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    match state.engine.scanner.start_scan(req.mode, req.paths).await {
+        Ok(scan_id) => Ok(Json(StartScanResponse {
+            scan_id,
+            status: ScanStatus::Running,
+        })),
+        Err(e) => Err(err_resp(StatusCode::CONFLICT, e.to_string())),
+    }
+}
+
+async fn cancel_scan(State(state): State<AppState>) -> impl IntoResponse {
+    let cancelled = state.engine.scanner.cancel_current_scan();
+    Json(CancelScanResponse { cancelled })
+}
+
+async fn get_current_scan(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.engine.scanner.current_progress())
+}
+
+async fn list_scan_history(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .engine
+        .storage
+        .list_scan_jobs(50)
+        .map(Json)
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn list_threats_history(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .engine
+        .storage
+        .list_threat_records(100)
         .map(Json)
         .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use kernlock_core::{
-    AlertStatus, EventCategory, PolicyConfig, QuarantineRecord, QuarantineStatus, SecurityEvent,
-    Severity, ThreatAlert,
+    AlertStatus, EventCategory, FileScanResult, PolicyConfig, QuarantineRecord, QuarantineStatus,
+    ScanJobSummary, ScanMode, ScanStatus, SecurityEvent, Severity, ThreatAlert, ThreatRecord,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -104,6 +104,37 @@ impl Storage {
                 config_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS scan_jobs (
+                id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                files_scanned INTEGER NOT NULL,
+                files_skipped INTEGER NOT NULL,
+                threats_found INTEGER NOT NULL,
+                errors_count INTEGER NOT NULL,
+                target_paths TEXT NOT NULL,
+                threats_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scan_jobs_ts ON scan_jobs(started_at DESC);
+
+            CREATE TABLE IF NOT EXISTS threat_history (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                threat_name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                risk_score INTEGER NOT NULL,
+                action_taken TEXT NOT NULL,
+                quarantine_id TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_threat_history_ts ON threat_history(timestamp DESC);
             ",
         )?;
         Ok(())
@@ -549,5 +580,225 @@ impl Storage {
             params![json, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    pub fn insert_scan_job(&self, job: &ScanJobSummary) -> Result<(), StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        conn.execute(
+            "INSERT INTO scan_jobs
+             (id, mode, status, started_at, completed_at, files_scanned, files_skipped, threats_found, errors_count, target_paths, threats_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                job.id.to_string(),
+                serde_json::to_string(&job.mode)?,
+                serde_json::to_string(&job.status)?,
+                job.started_at.to_rfc3339(),
+                job.completed_at.map(|d| d.to_rfc3339()),
+                job.files_scanned as i64,
+                job.files_skipped as i64,
+                job.threats_found as i64,
+                job.errors_count as i64,
+                serde_json::to_string(&job.target_paths)?,
+                serde_json::to_string(&job.threats)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_scan_job(&self, job: &ScanJobSummary) -> Result<(), StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        let updated = conn.execute(
+            "UPDATE scan_jobs SET
+             mode = ?1, status = ?2, completed_at = ?3, files_scanned = ?4, files_skipped = ?5,
+             threats_found = ?6, errors_count = ?7, target_paths = ?8, threats_json = ?9
+             WHERE id = ?10",
+            params![
+                serde_json::to_string(&job.mode)?,
+                serde_json::to_string(&job.status)?,
+                job.completed_at.map(|d| d.to_rfc3339()),
+                job.files_scanned as i64,
+                job.files_skipped as i64,
+                job.threats_found as i64,
+                job.errors_count as i64,
+                serde_json::to_string(&job.target_paths)?,
+                serde_json::to_string(&job.threats)?,
+                job.id.to_string(),
+            ],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::NotFound(format!("scan job {}", job.id)));
+        }
+        Ok(())
+    }
+
+    pub fn get_scan_job(&self, id: Uuid) -> Result<ScanJobSummary, StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT id, mode, status, started_at, completed_at, files_scanned, files_skipped, threats_found, errors_count, target_paths, threats_json
+                 FROM scan_jobs WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        match row {
+            Some((id_s, mode_s, status_s, start_s, end_s, scanned, skipped, threats, errors, targets_s, threats_s)) => {
+                let id = Uuid::parse_str(&id_s).unwrap_or_else(|_| Uuid::new_v4());
+                let mode: ScanMode = serde_json::from_str(&mode_s)?;
+                let status: ScanStatus = serde_json::from_str(&status_s)?;
+                let started_at = DateTime::parse_from_rfc3339(&start_s)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let completed_at = end_s.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc))
+                });
+                let target_paths: Vec<String> = serde_json::from_str(&targets_s)?;
+                let threats_list: Vec<FileScanResult> = serde_json::from_str(&threats_s)?;
+
+                Ok(ScanJobSummary {
+                    id,
+                    mode,
+                    status,
+                    started_at,
+                    completed_at,
+                    files_scanned: scanned as usize,
+                    files_skipped: skipped as usize,
+                    threats_found: threats as usize,
+                    errors_count: errors as usize,
+                    target_paths,
+                    threats: threats_list,
+                })
+            }
+            None => Err(StorageError::NotFound(format!("scan job {}", id))),
+        }
+    }
+
+    pub fn list_scan_jobs(&self, limit: usize) -> Result<Vec<ScanJobSummary>, StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, mode, status, started_at, completed_at, files_scanned, files_skipped, threats_found, errors_count, target_paths, threats_json
+             FROM scan_jobs ORDER BY started_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (id_s, mode_s, status_s, start_s, end_s, scanned, skipped, threats, errors, targets_s, threats_s) = r?;
+            out.push(ScanJobSummary {
+                id: Uuid::parse_str(&id_s).unwrap_or_else(|_| Uuid::new_v4()),
+                mode: serde_json::from_str(&mode_s)?,
+                status: serde_json::from_str(&status_s)?,
+                started_at: DateTime::parse_from_rfc3339(&start_s)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                completed_at: end_s.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc))
+                }),
+                files_scanned: scanned as usize,
+                files_skipped: skipped as usize,
+                threats_found: threats as usize,
+                errors_count: errors as usize,
+                target_paths: serde_json::from_str(&targets_s)?,
+                threats: serde_json::from_str(&threats_s)?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn insert_threat_record(&self, record: &ThreatRecord) -> Result<(), StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        conn.execute(
+            "INSERT INTO threat_history
+             (id, timestamp, threat_name, path, sha256, severity, confidence, risk_score, action_taken, quarantine_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.id.to_string(),
+                record.timestamp.to_rfc3339(),
+                record.threat_name,
+                record.path,
+                record.sha256,
+                serde_json::to_string(&record.severity)?,
+                serde_json::to_string(&record.confidence)?,
+                record.risk_score as i64,
+                record.action_taken,
+                record.quarantine_id.map(|u| u.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_threat_records(&self, limit: usize) -> Result<Vec<ThreatRecord>, StorageError> {
+        let conn = self.conn.lock().map_err(|_| StorageError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, timestamp, threat_name, path, sha256, severity, confidence, risk_score, action_taken, quarantine_id
+             FROM threat_history ORDER BY timestamp DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (id_s, ts_s, threat_name, path, sha256, sev_s, conf_s, score, action, q_id_s) = r?;
+            out.push(ThreatRecord {
+                id: Uuid::parse_str(&id_s).unwrap_or_else(|_| Uuid::new_v4()),
+                timestamp: DateTime::parse_from_rfc3339(&ts_s)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                threat_name,
+                path,
+                sha256,
+                severity: serde_json::from_str(&sev_s)?,
+                confidence: serde_json::from_str(&conf_s)?,
+                risk_score: score as u32,
+                action_taken: action,
+                quarantine_id: q_id_s.and_then(|s| Uuid::parse_str(&s).ok()),
+            });
+        }
+        Ok(out)
     }
 }
