@@ -29,6 +29,8 @@ use {
 
 #[cfg(target_os = "linux")]
 pub const FAN_OPEN_EXEC_PERM: u64 = 0x0004_0000;
+#[cfg(target_os = "linux")]
+pub const FAN_EVENT_ON_CHILD: u64 = 0x0800_0000;
 
 #[derive(Debug, Clone)]
 pub struct FanotifyProbeDetails {
@@ -294,7 +296,10 @@ impl FanotifyPermissionMonitor {
         }
 
         let mut exec_supported = true;
-        let mask = libc::FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM;
+        let mut mask = libc::FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM;
+        if target.is_some() {
+            mask |= FAN_EVENT_ON_CHILD;
+        }
         let target_path_str = target
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "/".to_string());
@@ -314,11 +319,15 @@ impl FanotifyPermissionMonitor {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINVAL) {
                 exec_supported = false;
+                let mut fallback_mask = libc::FAN_OPEN_PERM;
+                if target.is_some() {
+                    fallback_mask |= FAN_EVENT_ON_CHILD;
+                }
                 let fallback = unsafe {
                     libc::fanotify_mark(
                         fd,
                         mark_flags,
-                        libc::FAN_OPEN_PERM,
+                        fallback_mask,
                         libc::AT_FDCWD,
                         target_c.as_ptr(),
                     )

