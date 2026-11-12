@@ -2,6 +2,51 @@ export type SecurityMode = "audit" | "protection" | "strict";
 export type Severity = "info" | "low" | "medium" | "high" | "critical";
 export type AlertStatus = "open" | "acknowledged" | "quarantined" | "resolved" | "false_positive";
 export type QuarantineStatus = "quarantined" | "restoring" | "restored" | "deleting" | "deleted";
+export type ScanMode = "quick" | "full" | "custom";
+export type ScanStatus = "queued" | "running" | "completed" | "cancelled" | "failed";
+export type DetectionConfidence = "low" | "medium" | "high" | "certain";
+
+export interface ScanProgress {
+  scan_id: string;
+  mode: ScanMode;
+  status: ScanStatus;
+  current_path: string;
+  files_scanned: number;
+  files_skipped: number;
+  threats_found: number;
+  errors_count: number;
+  is_complete: boolean;
+  is_cancelled: boolean;
+  started_at: string;
+  elapsed_seconds: number;
+}
+
+export interface ScanJobSummary {
+  id: string;
+  mode: ScanMode;
+  status: ScanStatus;
+  started_at: string;
+  completed_at: string | null;
+  files_scanned: number;
+  files_skipped: number;
+  threats_found: number;
+  errors_count: number;
+  target_paths: string[];
+  threats: FileScanResult[];
+}
+
+export interface ThreatRecord {
+  id: string;
+  timestamp: string;
+  threat_name: string;
+  path: string;
+  sha256: string;
+  severity: Severity;
+  confidence: DetectionConfidence;
+  risk_score: number;
+  action_taken: string;
+  quarantine_id: string | null;
+}
 
 export interface RuleMatch {
   rule_id: string;
@@ -49,6 +94,7 @@ export interface SystemStatus {
   capabilities: PlatformCapabilities;
   policy: PolicyConfig;
   watcher_active: boolean;
+  fanotify_active: boolean;
   rules_loaded: number;
 }
 
@@ -85,6 +131,8 @@ export interface FileScanResult {
   entropy: number;
   risk_score: number;
   severity: Severity;
+  confidence?: DetectionConfidence;
+  threat_name?: string | null;
   is_suspicious: boolean;
   excluded: boolean;
   matches: RuleMatch[];

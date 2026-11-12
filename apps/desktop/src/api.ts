@@ -8,10 +8,14 @@ import type {
   PolicyConfig,
   ProcessInfo,
   QuarantineRecord,
+  ScanJobSummary,
+  ScanMode,
+  ScanProgress,
   SecurityEvent,
   SecurityReport,
   SystemStatus,
   ThreatAlert,
+  ThreatRecord,
 } from "./types";
 
 const isTauri =
@@ -114,6 +118,18 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ path }),
     }),
+  startScan: (mode: ScanMode, paths?: string[]) =>
+    request<{ scan_id: string; status: string }>("/api/scan/start", {
+      method: "POST",
+      body: JSON.stringify({ mode, paths }),
+    }),
+  cancelScan: () =>
+    request<{ cancelled: boolean }>("/api/scan/cancel", {
+      method: "POST",
+    }),
+  getCurrentScan: () => request<ScanProgress | null>("/api/scan/current"),
+  getScanHistory: () => request<ScanJobSummary[]>("/api/scan/history"),
+  getThreatsHistory: () => request<ThreatRecord[]>("/api/threats/history"),
   analyzeCommand: (command: string) =>
     request<CommandAnalysisResult>("/api/analyze/command", {
       method: "POST",
