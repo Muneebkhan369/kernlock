@@ -161,6 +161,9 @@ pub enum FailureInjection {
     DeleteRollbackStagingMetadataPermission,
     DeleteCleanupStagingMetadataPermission,
     DeleteUnlinkCleanup,
+    DeletePostUnlinkMetadataPermission,
+    DeletePostUnlinkIoError,
+    DeletePostUnlinkFileStillPresent,
 }
 
 #[derive(Clone)]
@@ -1126,10 +1129,10 @@ impl QuarantineManager {
             })();
 
             if let Err(rb_err) = rollback_res {
-                let stranded = if fs::symlink_metadata(&deleting_path).is_ok() {
-                    &deleting_path
-                } else {
-                    &vault_path
+                let stranded = match fs::symlink_metadata(&deleting_path) {
+                    Ok(_) => &deleting_path,
+                    Err(e) if e.kind() == ErrorKind::NotFound => &vault_path,
+                    Err(_) => &deleting_path,
                 };
                 return Err(QuarantineError::RollbackFailed(Box::new(
                     RollbackFailureInfo {
@@ -1190,22 +1193,56 @@ impl QuarantineManager {
                     )));
                 }
 
-                if fs::symlink_metadata(&deleting_path).is_ok() {
-                    return Err(QuarantineError::CleanupFailed(Box::new(
-                        CleanupFailureInfo {
-                            operation: "delete_verify_unlinked",
-                            cause: "remove_file succeeded but staging file still exists"
-                                .to_string(),
-                            cleanup_error: "Staging file still present after remove_file"
-                                .to_string(),
-                            stranded_files: vec![deleting_path.display().to_string()],
-                            recovery_hint: format!(
-                                "Record {} is Deleted in DB; manually remove '{}'",
-                                id,
-                                deleting_path.display()
-                            ),
-                        },
-                    )));
+                let post_unlink_meta = match inject {
+                    FailureInjection::DeletePostUnlinkMetadataPermission => Err(io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        "injected post-unlink metadata permission denied",
+                    )),
+                    FailureInjection::DeletePostUnlinkIoError => Err(io::Error::other(
+                        "injected post-unlink metadata I/O failure",
+                    )),
+                    FailureInjection::DeletePostUnlinkFileStillPresent => {
+                        fs::symlink_metadata(&self.vault_dir)
+                    }
+                    _ => fs::symlink_metadata(&deleting_path),
+                };
+
+                match post_unlink_meta {
+                    Ok(_) => {
+                        return Err(QuarantineError::CleanupFailed(Box::new(
+                            CleanupFailureInfo {
+                                operation: "delete_verify_unlinked",
+                                cause: "remove_file succeeded but staging file still exists"
+                                    .to_string(),
+                                cleanup_error: "Staging file still present after remove_file"
+                                    .to_string(),
+                                stranded_files: vec![deleting_path.display().to_string()],
+                                recovery_hint: format!(
+                                    "Record {} is Deleted in DB; manually remove '{}'",
+                                    id,
+                                    deleting_path.display()
+                                ),
+                            },
+                        )));
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        // Cleanup verified successfully: staging file confirmed absent.
+                    }
+                    Err(e) => {
+                        return Err(QuarantineError::CleanupFailed(Box::new(
+                            CleanupFailureInfo {
+                                operation: "delete_verify_unlinked",
+                                cause: format!("Post-unlink metadata inspection failed: {e}"),
+                                cleanup_error: e.to_string(),
+                                stranded_files: vec![deleting_path.display().to_string()],
+                                recovery_hint: format!(
+                                    "Record {} is Deleted in DB; check whether staging file '{}' still exists",
+                                    id,
+                                    deleting_path.display()
+                                ),
+                            },
+                        )));
+                    }
                 }
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -1284,6 +1321,12 @@ impl QuarantineManager {
                                 let bytes = match read_regular_nofollow(&path) {
                                     Ok(b) => b,
                                     Err(e) => {
+                                        report.recovery_failures.push(RecoveryFailure {
+                                            id: Some(id),
+                                            path: Some(path.display().to_string()),
+                                            stage: "read_deleting_staging",
+                                            error: e.to_string(),
+                                        });
                                         report.unverified_stranded_files.push(
                                             UnverifiedStrandedFile {
                                                 path: path.display().to_string(),
@@ -1292,6 +1335,13 @@ impl QuarantineManager {
                                             ),
                                             },
                                         );
+                                        report.unresolved_states.push(UnresolvedRecoveryState {
+                                            id,
+                                            status: record.status,
+                                            reason: format!(
+                                                "Staging file unreadable ({e}); preserved without modification"
+                                            ),
+                                        });
                                         continue;
                                     }
                                 };
@@ -1628,6 +1678,12 @@ impl QuarantineManager {
                         let bytes = match read_regular_nofollow(&path) {
                             Ok(b) => b,
                             Err(e) => {
+                                report.recovery_failures.push(RecoveryFailure {
+                                    id: None,
+                                    path: Some(path.display().to_string()),
+                                    stage: "read_kernlock_staging",
+                                    error: e.to_string(),
+                                });
                                 report
                                     .unverified_stranded_files
                                     .push(UnverifiedStrandedFile {
@@ -2066,14 +2122,33 @@ impl QuarantineManager {
                 }
             };
 
-            let vault_is_absent = matches!(
-                fs::symlink_metadata(&vault_path),
-                Err(e) if e.kind() == ErrorKind::NotFound
-            );
-            let orig_is_absent = matches!(
-                fs::symlink_metadata(&orig_path),
-                Err(e) if e.kind() == ErrorKind::NotFound
-            );
+            let vault_meta_res = fs::symlink_metadata(&vault_path);
+            let vault_is_absent =
+                matches!(vault_meta_res, Err(ref e) if e.kind() == ErrorKind::NotFound);
+            if let Err(ref e) = vault_meta_res {
+                if e.kind() != ErrorKind::NotFound {
+                    report.recovery_failures.push(RecoveryFailure {
+                        id: Some(record.id),
+                        path: Some(vault_path.display().to_string()),
+                        stage: "check_vault_path_metadata_restoring_recovery",
+                        error: e.to_string(),
+                    });
+                }
+            }
+
+            let orig_meta_res = fs::symlink_metadata(&orig_path);
+            let orig_is_absent =
+                matches!(orig_meta_res, Err(ref e) if e.kind() == ErrorKind::NotFound);
+            if let Err(ref e) = orig_meta_res {
+                if e.kind() != ErrorKind::NotFound {
+                    report.recovery_failures.push(RecoveryFailure {
+                        id: Some(record.id),
+                        path: Some(orig_path.display().to_string()),
+                        stage: "check_orig_path_metadata_restoring_recovery",
+                        error: e.to_string(),
+                    });
+                }
+            }
 
             if orig_valid && vault_is_absent {
                 // Crash happened after move to destination was completed!
@@ -2243,7 +2318,14 @@ pub fn read_regular_nofollow(path: &Path) -> io::Result<Vec<u8>> {
         // O_NONBLOCK: open special files (like FIFOs or sockets) without blocking indefinitely.
         opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT (0x00200000): open reparse point directly without following it.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let meta = fs::symlink_metadata(path)?;
         if meta.file_type().is_symlink() {
@@ -2272,13 +2354,32 @@ pub fn read_regular_nofollow(path: &Path) -> io::Result<Vec<u8>> {
         ));
     }
 
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Refusing to follow reparse point (symlink/junction): {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags >= 0 {
-            unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let set_res = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+        if set_res < 0 {
+            return Err(io::Error::last_os_error());
         }
     }
 
@@ -2433,7 +2534,25 @@ pub fn cross_fs_copy_no_clobber(
             use std::os::unix::fs::OpenOptionsExt;
             src_opts.custom_flags(libc::O_NOFOLLOW);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+            src_opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
         let mut src_file = src_opts.open(src)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+            let meta = src_file.metadata()?;
+            if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Refusing to copy reparse point: {}", src.display()),
+                ));
+            }
+        }
 
         let mut dst_opts = OpenOptions::new();
         dst_opts.write(true).create_new(true);

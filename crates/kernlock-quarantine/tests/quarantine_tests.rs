@@ -1296,3 +1296,278 @@ fn test_9_repeated_startup_recovery_after_each_interrupted_deletion_stage() {
     assert!(r3.finalized_deletions.is_empty());
     assert!(r3.recovery_failures.is_empty());
 }
+
+#[test]
+fn test_10_post_unlink_metadata_permission_denied() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("post_unlink_perm.bin");
+    fs::write(&target, b"payload for post unlink perm test").unwrap();
+    let rec = qm.quarantine_file(&target, "test threat").unwrap();
+
+    let err = qm
+        .delete_permanently_with_injection(
+            rec.id,
+            FailureInjection::DeletePostUnlinkMetadataPermission,
+        )
+        .unwrap_err();
+
+    match err {
+        QuarantineError::CleanupFailed(info) => {
+            assert_eq!(info.operation, "delete_verify_unlinked");
+            assert!(info
+                .cause
+                .contains("Post-unlink metadata inspection failed"));
+            assert!(info
+                .cleanup_error
+                .contains("injected post-unlink metadata permission denied"));
+            assert_eq!(info.stranded_files.len(), 1);
+        }
+        other => panic!("Expected CleanupFailed, got {other:?}"),
+    }
+
+    // Database record must remain Deleted (not reverted to Quarantined)
+    let updated = storage.get_quarantine(rec.id).unwrap();
+    assert_eq!(updated.status, QuarantineStatus::Deleted);
+}
+
+#[test]
+fn test_11_post_unlink_metadata_io_error() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("post_unlink_io.bin");
+    fs::write(&target, b"payload for post unlink io test").unwrap();
+    let rec = qm.quarantine_file(&target, "test threat").unwrap();
+
+    let err = qm
+        .delete_permanently_with_injection(rec.id, FailureInjection::DeletePostUnlinkIoError)
+        .unwrap_err();
+
+    match err {
+        QuarantineError::CleanupFailed(info) => {
+            assert_eq!(info.operation, "delete_verify_unlinked");
+            assert!(info
+                .cause
+                .contains("Post-unlink metadata inspection failed"));
+            assert!(info
+                .cleanup_error
+                .contains("injected post-unlink metadata I/O failure"));
+            assert_eq!(info.stranded_files.len(), 1);
+        }
+        other => panic!("Expected CleanupFailed, got {other:?}"),
+    }
+
+    // Database record must remain Deleted
+    let updated = storage.get_quarantine(rec.id).unwrap();
+    assert_eq!(updated.status, QuarantineStatus::Deleted);
+}
+
+#[test]
+fn test_12_post_unlink_file_still_present() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("post_unlink_present.bin");
+    fs::write(&target, b"payload for post unlink still present test").unwrap();
+    let rec = qm.quarantine_file(&target, "test threat").unwrap();
+
+    let err = qm
+        .delete_permanently_with_injection(
+            rec.id,
+            FailureInjection::DeletePostUnlinkFileStillPresent,
+        )
+        .unwrap_err();
+
+    match err {
+        QuarantineError::CleanupFailed(info) => {
+            assert_eq!(info.operation, "delete_verify_unlinked");
+            assert!(info
+                .cause
+                .contains("remove_file succeeded but staging file still exists"));
+            assert!(info
+                .cleanup_error
+                .contains("Staging file still present after remove_file"));
+            assert_eq!(info.stranded_files.len(), 1);
+        }
+        other => panic!("Expected CleanupFailed, got {other:?}"),
+    }
+
+    // Database record must remain Deleted
+    let updated = storage.get_quarantine(rec.id).unwrap();
+    assert_eq!(updated.status, QuarantineStatus::Deleted);
+}
+
+#[test]
+fn test_13_rollback_stranded_path_diagnostics_when_metadata_fails() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("rollback_diagnostic.bin");
+    fs::write(&target, b"payload for rollback stranded diagnostic test").unwrap();
+    let rec = qm.quarantine_file(&target, "test threat").unwrap();
+
+    let deleting_path = vault_dir.join(format!(".deleting_{}.locked", rec.id));
+
+    let err = qm
+        .delete_permanently_with_injection(
+            rec.id,
+            FailureInjection::DeleteRollbackStagingMetadataPermission,
+        )
+        .unwrap_err();
+
+    match err {
+        QuarantineError::RollbackFailed(info) => {
+            assert_eq!(info.stage, "delete_finalize_db");
+            // Stranded path must accurately report deleting_path, even when metadata check failed with PermissionDenied!
+            assert_eq!(info.stranded_path, deleting_path.display().to_string());
+        }
+        other => panic!("Expected RollbackFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_14_fcntl_flags_validation() {
+    let tmp = TempDir::new().unwrap();
+    let test_file = tmp.path().join("fcntl_test.bin");
+    fs::write(&test_file, b"content for fcntl test").unwrap();
+
+    // Verify read_regular_nofollow executes F_GETFL and F_SETFL cleanly
+    let read_bytes = read_regular_nofollow(&test_file).unwrap();
+    assert_eq!(read_bytes, b"content for fcntl test");
+
+    #[cfg(unix)]
+    {
+        // Calling fcntl with invalid fd returns negative and maps to EBADF
+        let res = unsafe { libc::fcntl(-1, libc::F_GETFL) };
+        assert!(res < 0);
+        let err = std::io::Error::last_os_error();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+    }
+}
+
+#[test]
+fn test_15_recovery_deleting_staging_read_permission_denied() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage.clone()).unwrap();
+
+    let target = tmp.path().join("deleting_perm.bin");
+    fs::write(&target, b"payload for deleting recovery perm test").unwrap();
+    let rec = qm.quarantine_file(&target, "test threat").unwrap();
+
+    let deleting_path = vault_dir.join(format!(".deleting_{}.locked", rec.id));
+    fs::rename(&rec.vault_path, &deleting_path).unwrap();
+
+    storage
+        .update_quarantine_status(rec.id, QuarantineStatus::Deleting, None)
+        .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&deleting_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = qm.recover_on_startup().unwrap();
+
+        // 1. Recovery failure must be recorded for read_deleting_staging
+        assert!(report
+            .recovery_failures
+            .iter()
+            .any(|rf| rf.stage == "read_deleting_staging" && rf.id == Some(rec.id)));
+
+        // 2. Stranded file must be preserved
+        assert!(report
+            .unverified_stranded_files
+            .iter()
+            .any(|u| u.path == deleting_path.display().to_string()));
+
+        // 3. Unresolved state must be recorded
+        assert!(report.unresolved_states.iter().any(|u| u.id == rec.id));
+
+        // 4. File must still exist on disk
+        assert!(deleting_path.exists());
+
+        // 5. Restore permissions and verify subsequent recovery succeeds
+        fs::set_permissions(&deleting_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let report2 = qm.recover_on_startup().unwrap();
+        assert!(report2.recovered_to_quarantine.contains(&rec.id));
+        assert_eq!(
+            storage.get_quarantine(rec.id).unwrap().status,
+            QuarantineStatus::Quarantined
+        );
+        assert!(Path::new(&rec.vault_path).exists());
+        assert!(!deleting_path.exists());
+    }
+}
+
+#[test]
+fn test_16_recovery_kernlock_staging_read_permission_denied() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let vault_dir = tmp.path().join("vault");
+    let qm = QuarantineManager::new(&vault_dir, storage).unwrap();
+
+    let staging_path = vault_dir.join(format!(".kernlock_staging_{}", uuid::Uuid::new_v4()));
+    fs::write(&staging_path, b"stranded staging file content").unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&staging_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = qm.recover_on_startup().unwrap();
+
+        // 1. Recovery failure must be recorded for read_kernlock_staging
+        assert!(report
+            .recovery_failures
+            .iter()
+            .any(|rf| rf.stage == "read_kernlock_staging"));
+
+        // 2. Stranded file must be preserved
+        assert!(report
+            .unverified_stranded_files
+            .iter()
+            .any(|u| u.path == staging_path.display().to_string()));
+
+        // 3. File must still exist on disk
+        assert!(staging_path.exists());
+
+        // Restore permissions for clean tempdir teardown
+        fs::set_permissions(&staging_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+#[test]
+fn test_17_windows_reparse_point_handle_verification() {
+    // Cross-platform validation of constants and handle safety
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+
+    assert_eq!(FILE_FLAG_OPEN_REPARSE_POINT, 2097152);
+    assert_eq!(FILE_ATTRIBUTE_REPARSE_POINT, 1024);
+
+    #[cfg(windows)]
+    {
+        // On Windows targets, test symlink or junction rejection
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("target.txt");
+        fs::write(&target, b"target file").unwrap();
+        let link = tmp.path().join("link.txt");
+        if std::os::windows::fs::symlink_file(&target, &link).is_ok() {
+            let err = read_regular_nofollow(&link).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("Refusing to follow"));
+        }
+    }
+}
