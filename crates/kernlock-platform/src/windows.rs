@@ -334,48 +334,7 @@ impl MinifilterClient {
             }
 
             // Secure File ID verification to eliminate TOCTOU path races
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::io::AsRawHandle;
-                #[repr(C)]
-                struct BY_HANDLE_FILE_INFORMATION {
-                    dw_file_attributes: u32,
-                    ft_creation_time: [u32; 2],
-                    ft_last_access_time: [u32; 2],
-                    ft_last_write_time: [u32; 2],
-                    dw_volume_serial_number: u32,
-                    n_file_size_high: u32,
-                    n_file_size_low: u32,
-                    n_number_of_links: u32,
-                    n_file_index_high: u32,
-                    n_file_index_low: u32,
-                }
-                extern "system" {
-                    fn GetFileInformationByHandle(
-                        h_file: *mut std::ffi::c_void,
-                        lp_file_information: *mut BY_HANDLE_FILE_INFORMATION,
-                    ) -> i32;
-                }
-
-                let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-                let ok = unsafe {
-                    GetFileInformationByHandle(
-                        file.as_raw_handle() as *mut std::ffi::c_void,
-                        &mut info,
-                    )
-                };
-                if ok != 0 {
-                    let opened_file_id =
-                        ((info.n_file_index_high as u64) << 32) | (info.n_file_index_low as u64);
-                    let req_file_id = request.file_id;
-                    if req_file_id != 0 && opened_file_id != req_file_id {
-                        return Err(format!(
-                            "TOCTOU race detected: opened file ID {} does not match kernel file ID {}",
-                            opened_file_id, req_file_id
-                        ));
-                    }
-                }
-            }
+            Self::verify_file_identity(&file, request.file_id, policy.mode, &file_path_str)?;
 
             kernlock_core::analyzer::scan_stream_reader(&mut file, &file_path_str, rules, policy)
                 .map_err(|e| format!("Scan error: {}", e))
@@ -444,15 +403,15 @@ impl MinifilterClient {
             }
             Err(e) => {
                 tracing::warn!("Windows Minifilter scan error for {}: {}", file_path_str, e);
-                // Never silently evaluate unreadable files or scanner errors to clean:
-                // Strict mode fails closed (Block / STATUS_ACCESS_DENIED)
-                // Protection mode fails open (Allow / STATUS_SUCCESS)
-                if policy.mode == SecurityMode::Strict {
+                // Active security violations (such as TOCTOU race detection) fail closed in all modes.
+                // Strict mode fails closed on all errors (unreadable files, scanner faults, unverified identity).
+                // Protection mode fails open on benign scanner/unreadable errors only.
+                if e.contains("TOCTOU") || policy.mode == SecurityMode::Strict {
                     RawExecutionResponseMsg::new(
                         message_id,
                         ExecutionVerdict::Block,
                         STATUS_ACCESS_DENIED,
-                        "Scan error or unreadable file in Strict mode (fail-closed)",
+                        &format!("Execution blocked: {}", e),
                     )
                 } else {
                     RawExecutionResponseMsg::new(
@@ -463,6 +422,136 @@ impl MinifilterClient {
                     )
                 }
             }
+        }
+    }
+
+    /// Verify that the opened file handle matches the FileId intercepted by the driver.
+    /// In Strict mode: failures to obtain or match FileId fail closed.
+    /// In Protection/Audit mode: identity mismatches fail closed; unavailable FileId logs a warning.
+    pub fn verify_file_identity(
+        file: &fs::File,
+        expected_file_id: u64,
+        mode: SecurityMode,
+        file_path_str: &str,
+    ) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::io::AsRawHandle;
+            #[repr(C)]
+            struct BY_HANDLE_FILE_INFORMATION {
+                dw_file_attributes: u32,
+                ft_creation_time: [u32; 2],
+                ft_last_access_time: [u32; 2],
+                ft_last_write_time: [u32; 2],
+                dw_volume_serial_number: u32,
+                n_file_size_high: u32,
+                n_file_size_low: u32,
+                n_number_of_links: u32,
+                n_file_index_high: u32,
+                n_file_index_low: u32,
+            }
+            extern "system" {
+                fn GetFileInformationByHandle(
+                    h_file: *mut std::ffi::c_void,
+                    lp_file_information: *mut BY_HANDLE_FILE_INFORMATION,
+                ) -> i32;
+            }
+
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            let ok = unsafe {
+                GetFileInformationByHandle(file.as_raw_handle() as *mut std::ffi::c_void, &mut info)
+            };
+            if ok == 0 {
+                let err = std::io::Error::last_os_error();
+                if mode == SecurityMode::Strict {
+                    return Err(format!(
+                        "File identity verification failed (GetFileInformationByHandle error: {}) in Strict mode",
+                        err
+                    ));
+                } else {
+                    tracing::warn!(
+                        "GetFileInformationByHandle failed (error: {}) for {}; file identity unverified in Permissive mode",
+                        err,
+                        file_path_str
+                    );
+                    return Ok(());
+                }
+            }
+
+            let opened_file_id =
+                ((info.n_file_index_high as u64) << 32) | (info.n_file_index_low as u64);
+
+            if expected_file_id == 0 {
+                if mode == SecurityMode::Strict {
+                    return Err(format!(
+                        "Kernel FileId is zero for {}; unverified file identity rejected in Strict mode",
+                        file_path_str
+                    ));
+                } else {
+                    tracing::warn!(
+                        "Kernel FileId is zero for {}; file identity unverified in Permissive mode",
+                        file_path_str
+                    );
+                    return Ok(());
+                }
+            }
+
+            if opened_file_id != expected_file_id {
+                return Err(format!(
+                    "TOCTOU race detected: opened file ID {} does not match kernel file ID {} for {}",
+                    opened_file_id, expected_file_id, file_path_str
+                ));
+            }
+
+            Ok(())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(meta) = file.metadata() {
+                    let opened_file_id = meta.ino();
+                    if expected_file_id == 0 {
+                        if mode == SecurityMode::Strict {
+                            return Err(format!(
+                                "Kernel FileId is zero for {}; unverified file identity rejected in Strict mode",
+                                file_path_str
+                            ));
+                        } else {
+                            tracing::warn!(
+                                "Kernel FileId is zero for {}; file identity unverified in Permissive mode",
+                                file_path_str
+                            );
+                            return Ok(());
+                        }
+                    }
+
+                    if opened_file_id != expected_file_id {
+                        return Err(format!(
+                            "TOCTOU race detected: opened file ID {} does not match kernel file ID {} for {}",
+                            opened_file_id, expected_file_id, file_path_str
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
+
+            if expected_file_id == 0 {
+                if mode == SecurityMode::Strict {
+                    return Err(format!(
+                        "Kernel FileId is zero for {}; unverified file identity rejected in Strict mode",
+                        file_path_str
+                    ));
+                } else {
+                    tracing::warn!(
+                        "Kernel FileId is zero for {}; file identity unverified in Permissive mode",
+                        file_path_str
+                    );
+                    return Ok(());
+                }
+            }
+            Ok(())
         }
     }
 

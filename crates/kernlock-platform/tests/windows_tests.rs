@@ -194,3 +194,115 @@ fn test_raw_c_matching_minifilter_request_verdict_evaluation() {
     assert_eq!(missing_prot_verdict, ExecutionVerdict::Allow as u32);
     assert_eq!(missing_prot_ntstatus, STATUS_SUCCESS);
 }
+
+#[test]
+fn test_windows_file_identity_safety_and_toctou_prevention() {
+    use kernlock_core::rules::RuleEngine;
+    use kernlock_core::PolicyConfig;
+    use kernlock_platform::windows::{RawExecutionRequestMsg, RawMinifilterMsgHeader};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let clean_path = tmp.path().join("benign_app.exe");
+    let mut f = std::fs::File::create(&clean_path).unwrap();
+    f.write_all(b"#!/bin/sh\necho hello\n").unwrap();
+    f.sync_all().unwrap();
+
+    let client = MinifilterClient::new();
+    let rules = RuleEngine::builtin();
+    let threat_count = Arc::new(AtomicUsize::new(0));
+    let tc = threat_count.clone();
+    let on_threat = move |_event: kernlock_core::SecurityEvent,
+                          _alert: kernlock_core::ThreatAlert| {
+        tc.fetch_add(1, Ordering::SeqCst);
+    };
+
+    let path_str = clean_path.to_string_lossy().to_string();
+    let mut file_path_utf16 = [0u16; 1024];
+    for (i, c) in path_str.encode_utf16().enumerate() {
+        if i < 1023 {
+            file_path_utf16[i] = c;
+        }
+    }
+
+    // 1. In Strict mode, kernel file_id == 0 must fail closed (do not silently skip verification)
+    let zero_file_id_req = RawExecutionRequestMsg {
+        header: RawMinifilterMsgHeader {
+            message_id: 7001,
+            process_id: 1234,
+            thread_id: 5678,
+            timestamp: 999999,
+        },
+        desired_access: 0x0000_0020,
+        parent_process_id: 4,
+        file_id: 0,
+        file_path: file_path_utf16,
+    };
+    let strict_policy = PolicyConfig {
+        mode: SecurityMode::Strict,
+        ..Default::default()
+    };
+    let zero_strict_resp =
+        client.evaluate_request(&zero_file_id_req, &rules, &strict_policy, &on_threat);
+    let zero_strict_verdict = zero_strict_resp.verdict;
+    let zero_strict_ntstatus = zero_strict_resp.ntstatus;
+    assert_eq!(
+        zero_strict_verdict,
+        ExecutionVerdict::Block as u32,
+        "Strict mode must fail closed when FileId is zero"
+    );
+    assert_eq!(zero_strict_ntstatus, STATUS_ACCESS_DENIED);
+
+    // 2. In Protection mode, kernel file_id == 0 logs a warning and evaluates clean executable
+    let protection_policy = PolicyConfig {
+        mode: SecurityMode::Protection,
+        ..Default::default()
+    };
+    let zero_prot_resp =
+        client.evaluate_request(&zero_file_id_req, &rules, &protection_policy, &on_threat);
+    let zero_prot_verdict = zero_prot_resp.verdict;
+    let zero_prot_ntstatus = zero_prot_resp.ntstatus;
+    assert_eq!(
+        zero_prot_verdict,
+        ExecutionVerdict::Allow as u32,
+        "Protection mode allows clean executable when FileId is zero (with audit warning)"
+    );
+    assert_eq!(zero_prot_ntstatus, STATUS_SUCCESS);
+
+    // 3. TOCTOU race: opened file ID does not match kernel file ID -> must fail closed in all modes
+    let mismatched_req = RawExecutionRequestMsg {
+        header: RawMinifilterMsgHeader {
+            message_id: 7002,
+            process_id: 1234,
+            thread_id: 5678,
+            timestamp: 999999,
+        },
+        desired_access: 0x0000_0020,
+        parent_process_id: 4,
+        file_id: 0xDEAD_BEEF_CAFE_BABE, // definitely does not match actual file index/inode
+        file_path: file_path_utf16,
+    };
+    let toctou_prot_resp =
+        client.evaluate_request(&mismatched_req, &rules, &protection_policy, &on_threat);
+    let toctou_prot_verdict = toctou_prot_resp.verdict;
+    let toctou_prot_ntstatus = toctou_prot_resp.ntstatus;
+    assert_eq!(
+        toctou_prot_verdict,
+        ExecutionVerdict::Block as u32,
+        "Mismatched FileId (TOCTOU) must fail closed in Protection mode"
+    );
+    assert_eq!(toctou_prot_ntstatus, STATUS_ACCESS_DENIED);
+
+    let toctou_strict_resp =
+        client.evaluate_request(&mismatched_req, &rules, &strict_policy, &on_threat);
+    let toctou_strict_verdict = toctou_strict_resp.verdict;
+    let toctou_strict_ntstatus = toctou_strict_resp.ntstatus;
+    assert_eq!(
+        toctou_strict_verdict,
+        ExecutionVerdict::Block as u32,
+        "Mismatched FileId (TOCTOU) must fail closed in Strict mode"
+    );
+    assert_eq!(toctou_strict_ntstatus, STATUS_ACCESS_DENIED);
+}

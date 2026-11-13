@@ -21,4 +21,14 @@
   <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\native\Microsoft.Windows.SDK.cpp.props')" />
   <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.3323\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.3323\build\native\Microsoft.Windows.SDK.cpp.props')" />
   <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.props')" />
+
+  <!-- Explicit WDK tool paths for driver build tasks (StampInf, Inf2Cat, etc.) -->
+  <PropertyGroup>
+    <WdkContentRoot Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.WDK.x64.10.0.28000.2526\c\')">$(WdkPackagesDir)Microsoft.Windows.WDK.x64.10.0.28000.2526\c\</WdkContentRoot>
+    <WDKBinRoot Condition="Exists('$(WdkContentRoot)bin\10.0.28000.0')">$(WdkContentRoot)bin\10.0.28000.0</WDKBinRoot>
+    <WDKBinRoot_x64 Condition="Exists('$(WDKBinRoot)\x64')">$(WDKBinRoot)\x64</WDKBinRoot_x64>
+    <WDKBinRoot_x86 Condition="Exists('$(WDKBinRoot)\x86')">$(WDKBinRoot)\x86</WDKBinRoot_x86>
+    <InfToolPath Condition="Exists('$(WDKBinRoot_x64)')">$(WDKBinRoot_x64)\</InfToolPath>
+    <StampInfToolPath Condition="Exists('$(WDKBinRoot_x64)')">$(WDKBinRoot_x64)\</StampInfToolPath>
+  </PropertyGroup>
 </Project>

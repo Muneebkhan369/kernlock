@@ -100,6 +100,12 @@ jobs:
       - name: Build Minifilter Driver (kernlock_filter.sys)
         shell: pwsh
         run: |
+          # Add WDK bin path to PATH so stampinf.exe and related tools can be located by Tracker/MSBuild
+          $wdkBin = Resolve-Path "crates/kernlock-platform/driver/windows/packages/Microsoft.Windows.WDK.x64.*/c/bin/10.0.28000.0/x64" -ErrorAction SilentlyContinue
+          if ($wdkBin) {
+            Write-Host "Adding WDK tools to PATH: $($wdkBin.Path)"
+            $env:PATH = "$($wdkBin.Path);$env:PATH"
+          }
           msbuild crates/kernlock-platform/driver/windows/kernlock_filter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=Off
 
       - name: Verify Minifilter Driver binary exists
@@ -113,8 +119,13 @@ jobs:
             Write-Error "kernlock_filter.sys was not produced by MSBuild!"
             exit 1
           }
-          Write-Host "Found driver binary at: $($driverFiles[0].FullName)"
-          Write-Host "File size: $($driverFiles[0].Length) bytes"
+          $driver = $driverFiles[0]
+          Write-Host "Found driver binary at: $($driver.FullName)"
+          Write-Host "File size: $($driver.Length) bytes"
+          if ($driver.Length -le 0) {
+            Write-Error "kernlock_filter.sys exists but is empty!"
+            exit 1
+          }
 
   macos-build-and-test:
     name: macOS Test & Endpoint Security Client Verification
@@ -135,10 +146,15 @@ jobs:
       - name: Compile Apple EndpointSecurity C Client
         run: |
           mkdir -p target
+          SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
+          echo "Using macOS SDK at: $SDK_PATH"
           clang -Wall -Wextra -Werror -fblocks \
-            -framework EndpointSecurity -framework Foundation \
+            -isysroot "$SDK_PATH" \
+            -L"$SDK_PATH/usr/lib" \
+            -lEndpointSecurity -framework Foundation \
             crates/kernlock-platform/extension/macos/main.c \
             -o target/kernlock_es_client
+          ls -la target/kernlock_es_client
 
       - name: Build macOS System Extension Xcode Project
         run: |
@@ -151,4 +167,14 @@ jobs:
 
       - name: Verify macOS System Extension binary exists
         run: |
-          find . -name "com.kernlock.security.dext" -o -name "com.kernlock.security.dext.systemextension"
+          if [ ! -f target/kernlock_es_client ]; then
+            echo "ERROR: target/kernlock_es_client not found!"
+            exit 1
+          fi
+          EXT_PATH=$(find . -name "com.kernlock.security.dext" -o -name "com.kernlock.security.dext.systemextension" | head -n 1)
+          if [ -z "$EXT_PATH" ]; then
+            echo "ERROR: com.kernlock.security.dext extension bundle not found!"
+            exit 1
+          fi
+          echo "Found macOS System Extension at: $EXT_PATH"
+          ls -la "$EXT_PATH"

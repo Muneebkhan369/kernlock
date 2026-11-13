@@ -8,12 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		9B00000129B1234500000001 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 9B00000229B1234500000001 /* main.c */; };
-		9B00000329B1234500000001 /* EndpointSecurity.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9B00000429B1234500000001 /* EndpointSecurity.framework */; };
+		9B00000329B1234500000001 /* libEndpointSecurity.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 9B00000429B1234500000001 /* libEndpointSecurity.tbd */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		9B00000229B1234500000001 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
-		9B00000429B1234500000001 /* EndpointSecurity.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = EndpointSecurity.framework; path = System/Library/Frameworks/EndpointSecurity.framework; sourceTree = SDKROOT; };
+		9B00000429B1234500000001 /* libEndpointSecurity.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libEndpointSecurity.tbd; path = usr/lib/libEndpointSecurity.tbd; sourceTree = SDKROOT; };
 		9B00000529B1234500000001 /* com.kernlock.security.dext.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = com.kernlock.security.dext.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		9B00000629B1234500000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "com.kernlock.security.dext/Info.plist"; sourceTree = "<group>"; };
 		9B00000729B1234500000001 /* kernlock.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "com.kernlock.security.dext/kernlock.entitlements"; sourceTree = "<group>"; };
@@ -24,7 +24,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				9B00000329B1234500000001 /* EndpointSecurity.framework in Frameworks */,
+				9B00000329B1234500000001 /* libEndpointSecurity.tbd in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -53,7 +53,7 @@
 		9B00000B29B1234500000001 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
-				9B00000429B1234500000001 /* EndpointSecurity.framework */,
+				9B00000429B1234500000001 /* libEndpointSecurity.tbd */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -178,6 +178,9 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				OTHER_LDFLAGS = (
+					"-lEndpointSecurity",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kernlock.security.dext;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
@@ -193,6 +196,9 @@
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"-lEndpointSecurity",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kernlock.security.dext;
 				PRODUCT_NAME = "$(TARGET_NAME)";
