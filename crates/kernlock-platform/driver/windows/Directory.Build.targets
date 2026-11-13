@@ -8,8 +8,10 @@
   <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.3323\build\native\Microsoft.Windows.SDK.cpp.targets" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.26100.3323\build\native\Microsoft.Windows.SDK.cpp.targets')" />
   <Import Project="$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.targets" Condition="Exists('$(WdkPackagesDir)Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.targets')" />
 
+  <!-- Ensure StampInf target always runs before ClCompile to stamp kernlock_filter.inf -->
+  <Target Name="RunStampInfBeforeBuild" BeforeTargets="ClCompile" DependsOnTargets="StampInf" />
+
   <!-- Override post-build packaging verification targets that require missing x86 tools in x64 WDK NuGet package -->
-  <!-- Ensure StampInf runs to stamp and produce x64\Release\kernlock_filter.inf for driver packaging -->
-  <Target Name="InfVerif" DependsOnTargets="StampInf" />
+  <Target Name="InfVerif" />
   <Target Name="ApiValidator" />
 </Project>

@@ -100,12 +100,11 @@ jobs:
       - name: Build Minifilter Driver (kernlock_filter.sys)
         shell: pwsh
         run: |
-          # Add WDK bin path to PATH so stampinf.exe and related tools can be located by Tracker/MSBuild
-          $wdkBin = Resolve-Path "crates/kernlock-platform/driver/windows/packages/Microsoft.Windows.WDK.x64.*/c/bin/10.0.28000.0/x64" -ErrorAction SilentlyContinue
-          if ($wdkBin) {
-            Write-Host "Adding WDK tools to PATH: $($wdkBin.Path)"
-            $env:PATH = "$($wdkBin.Path);$env:PATH"
-          }
+          # Add WDK bin paths (both x64 and x86) to PATH so stampinf.exe and related tools can be located
+          $wdkX64 = Resolve-Path "crates/kernlock-platform/driver/windows/packages/Microsoft.Windows.WDK.x64.*/c/bin/10.0.28000.0/x64" -ErrorAction SilentlyContinue
+          $wdkX86 = Resolve-Path "crates/kernlock-platform/driver/windows/packages/Microsoft.Windows.WDK.x64.*/c/bin/10.0.28000.0/x86" -ErrorAction SilentlyContinue
+          if ($wdkX86) { $env:PATH = "$($wdkX86.Path);$env:PATH" }
+          if ($wdkX64) { $env:PATH = "$($wdkX64.Path);$env:PATH" }
           msbuild crates/kernlock-platform/driver/windows/kernlock_filter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=Off /p:EnableInfVerif=false /p:EnableApiValidator=false /p:EnableInf2Cat=false
 
       - name: Verify Minifilter Driver binary exists
