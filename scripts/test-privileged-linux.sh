@@ -15,10 +15,20 @@ if ! command -v cargo &>/dev/null; then
     done
 fi
 
-cargo test -p kernlock-platform --test fanotify_tests --no-run
+echo "==> Building Linux Privileged Fanotify Test Binary..."
+# Build test runner and capture exact executable path from cargo json message
+TEST_BIN=$(cargo test -p kernlock-platform --test fanotify_tests --no-run --message-format=json 2>/dev/null | grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | head -n 1)
 
 echo "==> Locating compiled fanotify_tests test runner binary..."
-TEST_BIN=$(ls -t target/debug/deps/fanotify_tests-* | grep -v '\.d$' | head -n 1)
+if [ -z "$TEST_BIN" ] || [ ! -x "$TEST_BIN" ]; then
+    TEST_BIN=$(find target/debug -name 'fanotify_tests*' -type f -perm -111 ! -name '*.d' | head -n 1)
+fi
+
+if [ -z "$TEST_BIN" ] || [ ! -x "$TEST_BIN" ]; then
+    echo "ERROR: Failed to locate fanotify_tests test runner binary!" >&2
+    exit 1
+fi
+echo "==> Found test binary at: $TEST_BIN"
 
 echo "==> Running Linux Privileged Fanotify Execution Blocking Acceptance Test..."
 if [ "$(id -u)" -eq 0 ]; then

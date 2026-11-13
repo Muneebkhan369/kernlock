@@ -106,7 +106,7 @@ jobs:
             Write-Host "Adding WDK tools to PATH: $($wdkBin.Path)"
             $env:PATH = "$($wdkBin.Path);$env:PATH"
           }
-          msbuild crates/kernlock-platform/driver/windows/kernlock_filter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=Off
+          msbuild crates/kernlock-platform/driver/windows/kernlock_filter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=Off /p:InfVerif=false /p:EnableInf2Cat=false
 
       - name: Verify Minifilter Driver binary exists
         shell: pwsh
@@ -151,7 +151,7 @@ jobs:
           clang -Wall -Wextra -Werror -fblocks \
             -isysroot "$SDK_PATH" \
             -L"$SDK_PATH/usr/lib" \
-            -lEndpointSecurity -framework Foundation \
+            -lEndpointSecurity -lbsm -framework Foundation \
             crates/kernlock-platform/extension/macos/main.c \
             -o target/kernlock_es_client
           ls -la target/kernlock_es_client

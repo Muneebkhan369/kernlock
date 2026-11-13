@@ -30,5 +30,7 @@
     <WDKBinRoot_x86 Condition="Exists('$(WDKBinRoot)\x86')">$(WDKBinRoot)\x86</WDKBinRoot_x86>
     <InfToolPath Condition="Exists('$(WDKBinRoot_x64)')">$(WDKBinRoot_x64)\</InfToolPath>
     <StampInfToolPath Condition="Exists('$(WDKBinRoot_x64)')">$(WDKBinRoot_x64)\</StampInfToolPath>
+    <InfVerif>false</InfVerif>
+    <EnableInf2Cat>false</EnableInf2Cat>
   </PropertyGroup>
 </Project>

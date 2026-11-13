@@ -180,6 +180,7 @@
 				);
 				OTHER_LDFLAGS = (
 					"-lEndpointSecurity",
+					"-lbsm",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kernlock.security.dext;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -199,6 +200,7 @@
 				);
 				OTHER_LDFLAGS = (
 					"-lEndpointSecurity",
+					"-lbsm",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kernlock.security.dext;
 				PRODUCT_NAME = "$(TARGET_NAME)";
