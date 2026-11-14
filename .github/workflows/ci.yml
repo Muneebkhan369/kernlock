@@ -171,9 +171,13 @@ jobs:
           $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=KernLock Security Test Driver" -CertStoreLocation "Cert:\CurrentUser\My"
           $signTool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
           if (!$signTool) {
-            $signTool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+            $signTool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*\x64\*" } | Select-Object -ExpandProperty FullName -First 1
+          }
+          if (!$signTool) {
+            $signTool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "*\arm*" } | Select-Object -ExpandProperty FullName -First 1
           }
           if ($signTool) {
+            Write-Host "Found signtool: $signTool"
             Write-Host "Signing driver binary ($($driver.FullName))..."
             & $signTool sign /v /s My /n "KernLock Security Test Driver" /fd SHA256 "$($driver.FullName)"
             $catFile = Join-Path $driverDir "kernlock_filter.cat"
@@ -239,9 +243,9 @@ jobs:
             echo "ERROR: target/kernlock_es_client not found!"
             exit 1
           fi
-          EXT_PATH=$(find . -name "com.kernlock.security.dext" -o -name "com.kernlock.security.dext.systemextension" | head -n 1)
+          EXT_PATH=$(find . -name "*.systemextension" | head -n 1)
           if [ -z "$EXT_PATH" ]; then
-            echo "ERROR: com.kernlock.security.dext extension bundle not found!"
+            echo "ERROR: .systemextension extension bundle not found!"
             exit 1
           fi
           echo "Found macOS System Extension at: $EXT_PATH"
@@ -255,7 +259,7 @@ jobs:
             exit 1
           fi
           echo "Endpoint Security entitlement verified in $ENT_FILE"
-          EXT_PATH=$(find . -name "com.kernlock.security.dext" -o -name "com.kernlock.security.dext.systemextension" | head -n 1)
+          EXT_PATH=$(find . -name "*.systemextension" | head -n 1)
           if [ -z "$EXT_PATH" ]; then
             echo "ERROR: System extension bundle not found!"
             exit 1
@@ -273,5 +277,5 @@ jobs:
           name: kernlock-macos-extension
           path: |
             target/kernlock_es_client
-            **/com.kernlock.security.dext*
+            crates/kernlock-platform/extension/macos/build/Release/*.systemextension
           if-no-files-found: warn
