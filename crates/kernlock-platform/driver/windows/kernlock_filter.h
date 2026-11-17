@@ -15,6 +15,10 @@ typedef enum _EXECUTION_VERDICT {
     VerdictAudit = 2
 } EXECUTION_VERDICT;
 
+typedef struct _KERNLOCK_PORT_CONTEXT {
+    unsigned long StrictMode; // 1 for Strict mode (fail-closed on disconnect/timeout), 0 for Protection/Audit
+} KERNLOCK_PORT_CONTEXT, *PKERNLOCK_PORT_CONTEXT;
+
 #pragma pack(push, 1)
 
 typedef struct _MINIFILTER_MSG_HEADER {
@@ -29,6 +33,7 @@ typedef struct _EXECUTION_REQUEST_MSG {
     unsigned long         DesiredAccess;
     unsigned long         ParentProcessId;
     unsigned __int64      FileId;
+    unsigned long         VolumeSerialNumber;
     wchar_t               FilePath[1024];
 } EXECUTION_REQUEST_MSG, *PEXECUTION_REQUEST_MSG;
 

@@ -80,9 +80,14 @@ chmod 0700 /var/lib/kernlock/quarantine
 
 # Reload systemd and enable/start service if systemd is active
 if [ -d /run/systemd/system ]; then
-    systemctl daemon-reload || true
-    systemctl enable kernlock.service || true
-    systemctl restart kernlock.service || true
+    systemctl daemon-reload
+    systemctl enable kernlock.service
+    systemctl restart kernlock.service
+    if ! systemctl is-active --quiet kernlock.service; then
+        echo "ERROR: kernlock.service failed to activate after installation" >&2
+        systemctl status kernlock.service --no-pager >&2 || true
+        exit 1
+    fi
 fi
 
 exit 0

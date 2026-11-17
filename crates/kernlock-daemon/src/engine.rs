@@ -316,6 +316,83 @@ impl KernLockEngine {
         }
     }
 
+    pub fn get_protection_state(&self) -> (String, String, Option<String>) {
+        let policy = self.storage.get_policy().unwrap_or_default();
+        let capabilities = self.capabilities();
+        let fanotify_active = self.is_fanotify_active();
+        let watcher_active = self.is_watcher_active();
+        let f_health = self.fanotify_health();
+
+        // 1. Check for fatal kernel enforcement monitor failure
+        if f_health == kernlock_platform::fanotify::FanotifyMonitorHealth::Failed {
+            return (
+                "Failed".to_string(),
+                "Failed".to_string(),
+                Some(
+                    "Kernel execution blocking monitor encountered a fatal runtime error"
+                        .to_string(),
+                ),
+            );
+        }
+
+        // 2. Kernel blocking capability unavailable in this environment
+        if !capabilities.kernel_blocking_available || !capabilities.is_privileged {
+            if watcher_active {
+                return (
+                    "Degraded".to_string(),
+                    "Degraded".to_string(),
+                    Some(
+                        "Kernel blocking unavailable (requires CAP_SYS_ADMIN/root). Operating in degraded mode with user-space filesystem watcher."
+                            .to_string(),
+                    ),
+                );
+            } else {
+                return (
+                    "Unavailable".to_string(),
+                    "Unavailable".to_string(),
+                    capabilities.fallback_reason.clone().or_else(|| {
+                        Some("Kernel execution blocking is unavailable in this environment (missing privileges/driver)".to_string())
+                    }),
+                );
+            }
+        }
+
+        // 3. Kernel blocking available and active
+        if fanotify_active {
+            if policy.mode == kernlock_core::SecurityMode::Audit {
+                return (
+                    "Degraded".to_string(),
+                    "Running".to_string(),
+                    Some("Audit Mode active: observing and logging without active kernel execution blocking.".to_string()),
+                );
+            } else {
+                return (
+                    "Active".to_string(),
+                    "Running".to_string(),
+                    Some("Kernel execution blocking active and enforcing.".to_string()),
+                );
+            }
+        }
+
+        // 4. Kernel blocking available but monitor not running
+        if watcher_active {
+            (
+                "Degraded".to_string(),
+                "Degraded".to_string(),
+                Some(
+                    "Kernel blocking monitor is standby; user-space filesystem watcher is active."
+                        .to_string(),
+                ),
+            )
+        } else {
+            (
+                "Degraded".to_string(),
+                "Standby".to_string(),
+                Some("Protection is in standby mode.".to_string()),
+            )
+        }
+    }
+
     pub fn start_fanotify_monitor(&self) {
         if !FanotifyPermissionMonitor::is_supported() {
             info!("fanotify is not supported on this host/environment; skipping kernel permission monitor");

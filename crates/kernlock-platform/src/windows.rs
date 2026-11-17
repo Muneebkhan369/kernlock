@@ -71,6 +71,7 @@ pub struct RawExecutionRequestMsg {
     pub desired_access: u32,
     pub parent_process_id: u32,
     pub file_id: u64,
+    pub volume_serial_number: u32,
     pub file_path: [u16; 1024],
 }
 
@@ -150,6 +151,8 @@ pub struct ExecutionRequestMessage {
     pub desired_access: u32,
     pub file_path: String,
     pub parent_process_id: u32,
+    pub file_id: u64,
+    pub volume_serial_number: u32,
     pub sha256_hex: Option<String>,
 }
 
@@ -333,8 +336,14 @@ impl MinifilterClient {
                 return Err("Target is not a regular file".to_string());
             }
 
-            // Secure File ID verification to eliminate TOCTOU path races
-            Self::verify_file_identity(&file, request.file_id, policy.mode, &file_path_str)?;
+            // Secure File ID & Volume identity verification to eliminate TOCTOU path races
+            Self::verify_file_identity(
+                &file,
+                request.file_id,
+                request.volume_serial_number,
+                policy.mode,
+                &file_path_str,
+            )?;
 
             kernlock_core::analyzer::scan_stream_reader(&mut file, &file_path_str, rules, policy)
                 .map_err(|e| format!("Scan error: {}", e))
@@ -425,12 +434,13 @@ impl MinifilterClient {
         }
     }
 
-    /// Verify that the opened file handle matches the FileId intercepted by the driver.
-    /// In Strict mode: failures to obtain or match FileId fail closed.
+    /// Verify that the opened file handle matches the FileId and Volume Serial Number intercepted by the driver.
+    /// In Strict mode: failures to obtain or match identity fail closed.
     /// In Protection/Audit mode: identity mismatches fail closed; unavailable FileId logs a warning.
     pub fn verify_file_identity(
         file: &fs::File,
         expected_file_id: u64,
+        expected_volume_serial: u32,
         mode: SecurityMode,
         file_path_str: &str,
     ) -> Result<(), String> {
@@ -465,12 +475,12 @@ impl MinifilterClient {
                 let err = std::io::Error::last_os_error();
                 if mode == SecurityMode::Strict {
                     return Err(format!(
-                        "File identity verification failed (GetFileInformationByHandle error: {}) in Strict mode",
-                        err
+                        "Unverified file handle: GetFileInformationByHandle failed (error: {}) for {}; rejected in Strict mode",
+                        err, file_path_str
                     ));
                 } else {
                     tracing::warn!(
-                        "GetFileInformationByHandle failed (error: {}) for {}; file identity unverified in Permissive mode",
+                        "Unverified file handle: GetFileInformationByHandle failed (error: {}) for {}; file identity unverified in Permissive mode",
                         err,
                         file_path_str
                     );
@@ -480,16 +490,26 @@ impl MinifilterClient {
 
             let opened_file_id =
                 ((info.n_file_index_high as u64) << 32) | (info.n_file_index_low as u64);
+            let opened_volume_serial = info.dw_volume_serial_number;
 
+            // 1. Verify volume identity (must match if provided by kernel)
+            if expected_volume_serial != 0 && opened_volume_serial != expected_volume_serial {
+                return Err(format!(
+                    "TOCTOU race detected: opened volume serial 0x{:08X} does not match kernel volume serial 0x{:08X} for {}",
+                    opened_volume_serial, expected_volume_serial, file_path_str
+                ));
+            }
+
+            // 2. Verify file identifier
             if expected_file_id == 0 {
                 if mode == SecurityMode::Strict {
                     return Err(format!(
-                        "Kernel FileId is zero for {}; unverified file identity rejected in Strict mode",
+                        "Unverified file handle: Kernel FileId is zero for {}; unverified file identity rejected in Strict mode",
                         file_path_str
                     ));
                 } else {
                     tracing::warn!(
-                        "Kernel FileId is zero for {}; file identity unverified in Permissive mode",
+                        "Unverified file handle: Kernel FileId is zero for {}; file identity unverified in Permissive mode",
                         file_path_str
                     );
                     return Ok(());
@@ -512,15 +532,27 @@ impl MinifilterClient {
                 use std::os::unix::fs::MetadataExt;
                 if let Ok(meta) = file.metadata() {
                     let opened_file_id = meta.ino();
+                    let opened_volume_serial = meta.dev() as u32;
+
+                    // 1. Verify volume identity
+                    if expected_volume_serial != 0 && opened_volume_serial != expected_volume_serial
+                    {
+                        return Err(format!(
+                            "TOCTOU race detected: opened volume serial 0x{:08X} does not match kernel volume serial 0x{:08X} for {}",
+                            opened_volume_serial, expected_volume_serial, file_path_str
+                        ));
+                    }
+
+                    // 2. Verify file identifier
                     if expected_file_id == 0 {
                         if mode == SecurityMode::Strict {
                             return Err(format!(
-                                "Kernel FileId is zero for {}; unverified file identity rejected in Strict mode",
+                                "Unverified file handle: Kernel FileId is zero for {}; unverified file identity rejected in Strict mode",
                                 file_path_str
                             ));
                         } else {
                             tracing::warn!(
-                                "Kernel FileId is zero for {}; file identity unverified in Permissive mode",
+                                "Unverified file handle: Kernel FileId is zero for {}; file identity unverified in Permissive mode",
                                 file_path_str
                             );
                             return Ok(());
@@ -533,6 +565,7 @@ impl MinifilterClient {
                             opened_file_id, expected_file_id, file_path_str
                         ));
                     }
+
                     return Ok(());
                 }
             }
@@ -540,12 +573,12 @@ impl MinifilterClient {
             if expected_file_id == 0 {
                 if mode == SecurityMode::Strict {
                     return Err(format!(
-                        "Kernel FileId is zero for {}; unverified file identity rejected in Strict mode",
+                        "Unverified file handle: Kernel FileId is zero for {}; unverified file identity rejected in Strict mode",
                         file_path_str
                     ));
                 } else {
                     tracing::warn!(
-                        "Kernel FileId is zero for {}; file identity unverified in Permissive mode",
+                        "Unverified file handle: Kernel FileId is zero for {}; file identity unverified in Permissive mode",
                         file_path_str
                     );
                     return Ok(());

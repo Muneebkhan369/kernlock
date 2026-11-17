@@ -52,6 +52,13 @@ jobs:
           ./scripts/package-deb.sh
           ls -lh target/debian/*.deb
 
+      - name: Upload Debian Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernlock-linux-deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+
   linux-privileged-acceptance:
     name: Linux Privileged Fanotify Acceptance Verification
     runs-on: ubuntu-latest
@@ -126,6 +133,68 @@ jobs:
             exit 1
           }
 
+      - name: Validate INF and Generate Catalog (Inf2Cat)
+        shell: pwsh
+        run: |
+          $driverFiles = Get-ChildItem -Path crates/kernlock-platform/driver/windows -Recurse -Filter kernlock_filter.sys
+          if ($driverFiles.Count -eq 0) {
+            $driverFiles = Get-ChildItem -Path . -Recurse -Filter kernlock_filter.sys
+          }
+          $driver = $driverFiles[0]
+          $driverDir = Split-Path $driver.FullName
+          $infFile = Join-Path $driverDir "kernlock_filter.inf"
+          if (!(Test-Path $infFile)) {
+            Copy-Item "crates/kernlock-platform/driver/windows/kernlock_filter.inf" $infFile
+          }
+          Write-Host "Verifying INF at: $infFile"
+          $inf2cat = (Get-Command inf2cat.exe -ErrorAction SilentlyContinue).Source
+          if (!$inf2cat) {
+            $inf2cat = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter inf2cat.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+          }
+          if ($inf2cat) {
+            Write-Host "Running Inf2Cat: $inf2cat"
+            & $inf2cat /driver:$driverDir /os:10_X64
+          } else {
+            Write-Warning "Inf2Cat not found in default paths; skipping catalog generation"
+          }
+
+      - name: Create Test Certificate and Test-Sign Driver
+        shell: pwsh
+        run: |
+          $driverFiles = Get-ChildItem -Path crates/kernlock-platform/driver/windows -Recurse -Filter kernlock_filter.sys
+          if ($driverFiles.Count -eq 0) {
+            $driverFiles = Get-ChildItem -Path . -Recurse -Filter kernlock_filter.sys
+          }
+          $driver = $driverFiles[0]
+          $driverDir = Split-Path $driver.FullName
+          Write-Host "Creating local self-signed code signing certificate for test driver..."
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=KernLock Security Test Driver" -CertStoreLocation "Cert:\CurrentUser\My"
+          $signTool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+          if (!$signTool) {
+            $signTool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+          }
+          if ($signTool) {
+            Write-Host "Signing driver binary ($($driver.FullName))..."
+            & $signTool sign /v /s My /n "KernLock Security Test Driver" /fd SHA256 "$($driver.FullName)"
+            $catFile = Join-Path $driverDir "kernlock_filter.cat"
+            if (Test-Path $catFile) {
+              Write-Host "Signing catalog ($catFile)..."
+              & $signTool sign /v /s My /n "KernLock Security Test Driver" /fd SHA256 $catFile
+            }
+          } else {
+            Write-Warning "signtool.exe not found in default paths; skipping test-signing"
+          }
+
+      - name: Upload Windows Minifilter Driver Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernlock-windows-driver
+          path: |
+            crates/kernlock-platform/driver/windows/**/kernlock_filter.sys
+            crates/kernlock-platform/driver/windows/**/kernlock_filter.inf
+            crates/kernlock-platform/driver/windows/**/kernlock_filter.cat
+          if-no-files-found: warn
+
   macos-build-and-test:
     name: macOS Test & Endpoint Security Client Verification
     runs-on: macos-latest
@@ -177,3 +246,32 @@ jobs:
           fi
           echo "Found macOS System Extension at: $EXT_PATH"
           ls -la "$EXT_PATH"
+
+      - name: Validate Endpoint Security Entitlements & Bundle Layout
+        run: |
+          ENT_FILE="crates/kernlock-platform/extension/macos/com.kernlock.security.dext/kernlock.entitlements"
+          if ! grep -q "com.apple.developer.endpoint-security.client" "$ENT_FILE"; then
+            echo "ERROR: Missing com.apple.developer.endpoint-security.client entitlement in $ENT_FILE"
+            exit 1
+          fi
+          echo "Endpoint Security entitlement verified in $ENT_FILE"
+          EXT_PATH=$(find . -name "com.kernlock.security.dext" -o -name "com.kernlock.security.dext.systemextension" | head -n 1)
+          if [ -z "$EXT_PATH" ]; then
+            echo "ERROR: System extension bundle not found!"
+            exit 1
+          fi
+          echo "Verifying extension bundle structure at $EXT_PATH"
+          if [ ! -d "$EXT_PATH/Contents/MacOS" ]; then
+            echo "ERROR: Missing Contents/MacOS directory in $EXT_PATH"
+            exit 1
+          fi
+          ls -la "$EXT_PATH/Contents/MacOS"
+
+      - name: Upload macOS Endpoint Security Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernlock-macos-extension
+          path: |
+            target/kernlock_es_client
+            **/com.kernlock.security.dext*
+          if-no-files-found: warn

@@ -96,6 +96,9 @@ export interface SystemStatus {
   watcher_active: boolean;
   fanotify_active: boolean;
   rules_loaded: number;
+  protection_state?: "Active" | "Degraded" | "Failed" | "Unavailable";
+  monitor_health?: string;
+  state_reason?: string | null;
 }
 
 export interface ProcessInfo {

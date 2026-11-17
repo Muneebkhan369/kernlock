@@ -25,6 +25,7 @@ PFLT_FILTER g_FilterHandle = NULL;
 PFLT_PORT g_ServerPort = NULL;
 PFLT_PORT g_ClientPort = NULL;
 static volatile LONG g_MessageCounter = 0;
+static volatile LONG g_StrictMode = 0;
 
 // Forward declarations
 FLT_PREOP_CALLBACK_STATUS
@@ -86,9 +87,14 @@ KernLockPortConnectNotify (
     )
 {
     UNREFERENCED_PARAMETER(ServerPortCookie);
-    UNREFERENCED_PARAMETER(ConnectionContext);
-    UNREFERENCED_PARAMETER(SizeOfContext);
     UNREFERENCED_PARAMETER(ConnectionPortCookie);
+
+    if (ConnectionContext != NULL && SizeOfContext >= sizeof(KERNLOCK_PORT_CONTEXT)) {
+        PKERNLOCK_PORT_CONTEXT ctx = (PKERNLOCK_PORT_CONTEXT)ConnectionContext;
+        g_StrictMode = (ctx->StrictMode != 0) ? 1 : 0;
+    } else {
+        g_StrictMode = 0;
+    }
 
     g_ClientPort = ClientPort;
     return STATUS_SUCCESS;
@@ -134,8 +140,15 @@ KernLockPreCreate (
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    // If no client (daemon) is connected to our communication port, allow (fail-open)
+    // If no client (daemon) is connected to our communication port:
+    // In Strict mode, fail-closed (STATUS_ACCESS_DENIED) to prevent unmonitored execution.
+    // In Protection/Audit mode, allow (fail-open) to maintain system responsiveness.
     if (g_ClientPort == NULL) {
+        if (g_StrictMode) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            return FLT_PREOP_COMPLETE;
+        }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -143,6 +156,11 @@ KernLockPreCreate (
                                        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
                                        &nameInfo);
     if (!NT_SUCCESS(status)) {
+        if (g_StrictMode) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            return FLT_PREOP_COMPLETE;
+        }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -155,7 +173,7 @@ KernLockPreCreate (
     requestMsg.Header.ThreadId = (unsigned long)(ULONG_PTR)PsGetCurrentThreadId();
     requestMsg.DesiredAccess = desiredAccess;
 
-    // Secure File ID extraction to eliminate user-mode TOCTOU path races
+    // Secure File ID & Volume identity extraction to eliminate user-mode TOCTOU races
     if (FltObjects->FileObject != NULL && FltObjects->Instance != NULL) {
         FILE_INTERNAL_INFORMATION internalInfo;
         RtlZeroMemory(&internalInfo, sizeof(FILE_INTERNAL_INFORMATION));
@@ -166,6 +184,17 @@ KernLockPreCreate (
                                                FileInternalInformation,
                                                NULL))) {
             requestMsg.FileId = (unsigned __int64)internalInfo.IndexNumber.QuadPart;
+        }
+
+        FILE_FS_VOLUME_INFORMATION volInfo;
+        RtlZeroMemory(&volInfo, sizeof(FILE_FS_VOLUME_INFORMATION));
+        if (NT_SUCCESS(FltQueryVolumeInformationFile(FltObjects->Instance,
+                                                     FltObjects->FileObject,
+                                                     &volInfo,
+                                                     sizeof(FILE_FS_VOLUME_INFORMATION),
+                                                     FileFsVolumeInformation,
+                                                     NULL))) {
+            requestMsg.VolumeSerialNumber = volInfo.VolumeSerialNumber;
         }
     }
 
@@ -198,11 +227,17 @@ KernLockPreCreate (
                 return FLT_PREOP_COMPLETE;
             }
         }
-    } else if (status == STATUS_TIMEOUT) {
-        // Explicit timeout handling: fail-open by default to avoid freezing system processes
+    } else if (status == STATUS_TIMEOUT || !NT_SUCCESS(status)) {
+        // In Strict mode: fail-closed on timeout, daemon error or packet failure.
+        // In Protection mode: fail-open to avoid system hang.
+        if (g_StrictMode) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            return FLT_PREOP_COMPLETE;
+        }
     }
 
-    // Default to allow on timeout or clean verdict
+    // Default to allow on clean verdict or fail-open in Protection mode
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
@@ -239,8 +274,15 @@ KernLockPreAcquireForSectionSynchronization (
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    // If no client (daemon) is connected to our communication port, allow (fail-open)
+    // If no client (daemon) is connected to our communication port:
+    // In Strict mode, fail-closed (STATUS_ACCESS_DENIED) to prevent unmonitored executable mapping.
+    // In Protection/Audit mode, allow (fail-open) to maintain system responsiveness.
     if (g_ClientPort == NULL) {
+        if (g_StrictMode) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            return FLT_PREOP_COMPLETE;
+        }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -248,6 +290,11 @@ KernLockPreAcquireForSectionSynchronization (
                                        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
                                        &nameInfo);
     if (!NT_SUCCESS(status)) {
+        if (g_StrictMode) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            return FLT_PREOP_COMPLETE;
+        }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -259,7 +306,7 @@ KernLockPreAcquireForSectionSynchronization (
     requestMsg.Header.ThreadId = (unsigned long)(ULONG_PTR)PsGetCurrentThreadId();
     requestMsg.DesiredAccess = pageProtection;
 
-    // Secure File ID extraction for section synchronization
+    // Secure File ID & Volume identity extraction for section synchronization
     if (FltObjects->FileObject != NULL && FltObjects->Instance != NULL) {
         FILE_INTERNAL_INFORMATION internalInfo;
         RtlZeroMemory(&internalInfo, sizeof(FILE_INTERNAL_INFORMATION));
@@ -270,6 +317,17 @@ KernLockPreAcquireForSectionSynchronization (
                                                FileInternalInformation,
                                                NULL))) {
             requestMsg.FileId = (unsigned __int64)internalInfo.IndexNumber.QuadPart;
+        }
+
+        FILE_FS_VOLUME_INFORMATION volInfo;
+        RtlZeroMemory(&volInfo, sizeof(FILE_FS_VOLUME_INFORMATION));
+        if (NT_SUCCESS(FltQueryVolumeInformationFile(FltObjects->Instance,
+                                                     FltObjects->FileObject,
+                                                     &volInfo,
+                                                     sizeof(FILE_FS_VOLUME_INFORMATION),
+                                                     FileFsVolumeInformation,
+                                                     NULL))) {
+            requestMsg.VolumeSerialNumber = volInfo.VolumeSerialNumber;
         }
     }
 
@@ -298,6 +356,13 @@ KernLockPreAcquireForSectionSynchronization (
                 Data->IoStatus.Information = 0;
                 return FLT_PREOP_COMPLETE;
             }
+        }
+    } else if (status == STATUS_TIMEOUT || !NT_SUCCESS(status)) {
+        // In Strict mode: fail-closed on timeout, daemon error or packet failure.
+        if (g_StrictMode) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            return FLT_PREOP_COMPLETE;
         }
     }
 

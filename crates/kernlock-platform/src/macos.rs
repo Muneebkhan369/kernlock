@@ -8,7 +8,6 @@ use kernlock_core::rules::RuleEngine;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Apple Endpoint Security Framework (ESF) Event Types
@@ -74,39 +73,64 @@ pub enum EndpointSecurityStatus {
     NotEntitled,
     NotPermitted,
     Active,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeClientHealth {
+    pub is_alive: bool,
+    pub last_heartbeat_timestamp: u64,
+    pub pid: Option<i32>,
+    pub status: EndpointSecurityStatus,
+}
+
+impl Default for NativeClientHealth {
+    fn default() -> Self {
+        Self {
+            is_alive: false,
+            last_heartbeat_timestamp: 0,
+            pid: None,
+            status: EndpointSecurityStatus::NotInstalled,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct EndpointSecurityClient {
-    active: Arc<AtomicBool>,
+    health: Arc<std::sync::RwLock<NativeClientHealth>>,
 }
 
 impl EndpointSecurityClient {
     pub fn new() -> Self {
         Self {
-            active: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(std::sync::RwLock::new(NativeClientHealth::default())),
         }
     }
 
-    /// Probe whether ESF client is authorized and initialized
-    pub fn probe_status(&self) -> EndpointSecurityStatus {
-        #[cfg(target_os = "macos")]
-        {
-            if self.active.load(Ordering::Acquire) {
-                EndpointSecurityStatus::Active
-            } else {
-                // On macOS, check if running as root and if Full Disk Access is granted
-                EndpointSecurityStatus::NotPermitted
-            }
+    /// Record verified native client handshake and health telemetry
+    pub fn record_native_heartbeat(&self, pid: i32, status: EndpointSecurityStatus) {
+        if let Ok(mut guard) = self.health.write() {
+            guard.is_alive = status == EndpointSecurityStatus::Active;
+            guard.pid = Some(pid);
+            guard.status = status;
+            guard.last_heartbeat_timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            EndpointSecurityStatus::NotInstalled
+    }
+
+    /// Probe whether ESF client is authorized and actively enforcing
+    pub fn probe_status(&self) -> EndpointSecurityStatus {
+        if let Ok(guard) = self.health.read() {
+            guard.status
+        } else {
+            EndpointSecurityStatus::Failed
         }
     }
 
     pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
+        self.probe_status() == EndpointSecurityStatus::Active
     }
 
     /// Pre-execution evaluation callback with fail-open (Protection) vs fail-closed (Strict) policy

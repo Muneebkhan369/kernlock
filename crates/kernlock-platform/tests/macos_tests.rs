@@ -87,3 +87,30 @@ fn test_macos_endpoint_security_verdict_evaluation() {
     assert_eq!(ES_AUTH_RESULT_ALLOW, 0);
     assert_eq!(ES_AUTH_RESULT_DENY, 1);
 }
+
+#[test]
+fn test_macos_native_client_health_integration() {
+    use kernlock_platform::macos::EndpointSecurityStatus;
+
+    let client = EndpointSecurityClient::new();
+    assert_eq!(client.probe_status(), EndpointSecurityStatus::NotInstalled);
+    assert!(!client.is_active());
+
+    // Native client reports AwaitingApproval
+    client.record_native_heartbeat(12345, EndpointSecurityStatus::AwaitingApproval);
+    assert_eq!(
+        client.probe_status(),
+        EndpointSecurityStatus::AwaitingApproval
+    );
+    assert!(!client.is_active());
+
+    // Native client successfully authorized by user/MDM and actively monitoring
+    client.record_native_heartbeat(12345, EndpointSecurityStatus::Active);
+    assert_eq!(client.probe_status(), EndpointSecurityStatus::Active);
+    assert!(client.is_active());
+
+    // Native client encounters a fatal error or revocation
+    client.record_native_heartbeat(12345, EndpointSecurityStatus::Failed);
+    assert_eq!(client.probe_status(), EndpointSecurityStatus::Failed);
+    assert!(!client.is_active());
+}

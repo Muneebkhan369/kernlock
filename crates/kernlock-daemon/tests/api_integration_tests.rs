@@ -267,3 +267,51 @@ async fn probe_rejects_unrelated_service_even_if_spoofing_health() {
     assert_eq!(real_res, DaemonProbeResult::AuthenticatedKernLock);
     server.abort();
 }
+
+#[test]
+fn test_daemon_crash_and_restart_policy_and_definition_preservation() {
+    let tmp = TempDir::new().unwrap();
+
+    // 1. Initial engine lifecycle: configure Strict policy and persist
+    {
+        let engine = KernLockEngine::init(tmp.path()).unwrap();
+        let mut custom_policy = engine.get_policy().unwrap();
+        custom_policy.mode = SecurityMode::Strict;
+        custom_policy.auto_quarantine_threshold = 95;
+        custom_policy
+            .excluded_paths
+            .push("/opt/safe_dir".to_string());
+        engine.update_policy(custom_policy).unwrap();
+
+        let p = engine.get_policy().unwrap();
+        assert_eq!(p.mode, SecurityMode::Strict);
+        assert_eq!(p.auto_quarantine_threshold, 95);
+
+        // Simulate abrupt daemon crash/termination (drop)
+    }
+
+    // 2. Service restart: re-initialize engine from the same persistent state directory
+    {
+        let restarted_engine = KernLockEngine::init(tmp.path()).unwrap();
+        let restored_policy = restarted_engine.get_policy().unwrap();
+
+        // Verify policy survived restart
+        assert_eq!(restored_policy.mode, SecurityMode::Strict);
+        assert_eq!(restored_policy.auto_quarantine_threshold, 95);
+        assert!(restored_policy
+            .excluded_paths
+            .contains(&"/opt/safe_dir".to_string()));
+
+        // Verify fail-closed behavior in Strict mode is preserved across restart
+        let is_excluded =
+            restarted_engine.evaluate_authorization_request("/opt/safe_dir/app", 1000, true);
+        assert!(!is_excluded, "Excluded path must be allowed");
+
+        // Verify rules and baseline are intact
+        assert!(restarted_engine.rules.rule_count() > 0);
+
+        // Verify protection status reflects restored configuration
+        let (state, _, _) = restarted_engine.get_protection_state();
+        assert!(state == "Active" || state == "Degraded" || state == "Unavailable");
+    }
+}

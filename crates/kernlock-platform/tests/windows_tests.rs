@@ -59,6 +59,8 @@ fn test_windows_minifilter_verdict_evaluation() {
         desired_access: 0x0000_0020, // FILE_EXECUTE
         file_path: "C:\\Windows\\Temp\\malicious.exe".to_string(),
         parent_process_id: 1000,
+        file_id: 0,
+        volume_serial_number: 0,
         sha256_hex: None,
     };
 
@@ -128,6 +130,7 @@ fn test_raw_c_matching_minifilter_request_verdict_evaluation() {
         desired_access: 0x0000_0020, // FILE_EXECUTE
         parent_process_id: 4,
         file_id: 0,
+        volume_serial_number: 0,
         file_path: file_path_utf16,
     };
 
@@ -168,6 +171,7 @@ fn test_raw_c_matching_minifilter_request_verdict_evaluation() {
         desired_access: 0x0000_0020,
         parent_process_id: 4,
         file_id: 0,
+        volume_serial_number: 0,
         file_path: missing_path_utf16,
     };
 
@@ -238,6 +242,7 @@ fn test_windows_file_identity_safety_and_toctou_prevention() {
         desired_access: 0x0000_0020,
         parent_process_id: 4,
         file_id: 0,
+        volume_serial_number: 0,
         file_path: file_path_utf16,
     };
     let strict_policy = PolicyConfig {
@@ -282,6 +287,7 @@ fn test_windows_file_identity_safety_and_toctou_prevention() {
         desired_access: 0x0000_0020,
         parent_process_id: 4,
         file_id: 0xDEAD_BEEF_CAFE_BABE, // definitely does not match actual file index/inode
+        volume_serial_number: 0,
         file_path: file_path_utf16,
     };
     let toctou_prot_resp =
@@ -305,4 +311,29 @@ fn test_windows_file_identity_safety_and_toctou_prevention() {
         "Mismatched FileId (TOCTOU) must fail closed in Strict mode"
     );
     assert_eq!(toctou_strict_ntstatus, STATUS_ACCESS_DENIED);
+
+    // 4. TOCTOU race: opened volume serial number does not match kernel volume serial number -> fail closed
+    let mismatched_vol_req = RawExecutionRequestMsg {
+        header: RawMinifilterMsgHeader {
+            message_id: 7003,
+            process_id: 1234,
+            thread_id: 5678,
+            timestamp: 999999,
+        },
+        desired_access: 0x0000_0020,
+        parent_process_id: 4,
+        file_id: 0,
+        volume_serial_number: 0x1234_5678, // non-zero expected volume serial that won't match opened file
+        file_path: file_path_utf16,
+    };
+    let vol_resp =
+        client.evaluate_request(&mismatched_vol_req, &rules, &protection_policy, &on_threat);
+    let vol_verdict = vol_resp.verdict;
+    let vol_ntstatus = vol_resp.ntstatus;
+    assert_eq!(
+        vol_verdict,
+        ExecutionVerdict::Block as u32,
+        "Mismatched Volume Serial (TOCTOU) must fail closed in Protection mode"
+    );
+    assert_eq!(vol_ntstatus, STATUS_ACCESS_DENIED);
 }

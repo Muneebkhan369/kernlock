@@ -332,6 +332,11 @@ export default function App() {
   const criticalCount = alerts.filter((a) => a.status === "open" && a.severity === "critical").length;
   const isFanotifyActive = status?.fanotify_active ?? false;
   const kernelBlockingSupported = status?.capabilities?.kernel_blocking_available ?? false;
+  const protectionState = status?.protection_state ?? (
+    isFanotifyActive
+      ? (status?.policy?.mode === "audit" ? "Degraded" : "Active")
+      : (status?.watcher_active ? "Degraded" : "Unavailable")
+  );
 
   return (
     <div className="app-shell">
@@ -484,19 +489,21 @@ export default function App() {
             >
               <span
                 className={`pulse-dot ${
-                  isFanotifyActive
+                  protectionState === "Active"
                     ? "online"
-                    : status?.watcher_active
+                    : protectionState === "Degraded"
                     ? "standby"
                     : "offline"
                 }`}
               />
-              {isFanotifyActive ? (
-                <span>Kernel Blocking Active</span>
-              ) : status?.watcher_active ? (
-                <span>Inotify Watch Active</span>
+              {protectionState === "Active" ? (
+                <span style={{ color: "#4ade80", fontWeight: 600 }}>Active (Kernel Enforcement)</span>
+              ) : protectionState === "Degraded" ? (
+                <span style={{ color: "#fbbf24", fontWeight: 600 }}>Degraded (Audit / User-space)</span>
+              ) : protectionState === "Failed" ? (
+                <span style={{ color: "#ef4444", fontWeight: 600 }}>Failed (Monitor Error)</span>
               ) : (
-                <span>Protection Standby</span>
+                <span style={{ color: "#94a3b8", fontWeight: 500 }}>Unavailable (Missing Privileges)</span>
               )}
             </div>
 
@@ -512,6 +519,26 @@ export default function App() {
         </header>
 
         {/* Banners */}
+        {protectionState !== "Active" && status?.state_reason && (
+          <div
+            className="banner"
+            style={{
+              background: protectionState === "Failed" ? "rgba(239, 68, 68, 0.15)" : "rgba(245, 158, 11, 0.12)",
+              borderColor: protectionState === "Failed" ? "rgba(239, 68, 68, 0.4)" : "rgba(245, 158, 11, 0.35)",
+              color: protectionState === "Failed" ? "#fca5a5" : "#fde68a",
+              marginBottom: 16,
+              fontSize: "0.85rem",
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+            }}
+          >
+            <AlertTriangle size={16} />
+            <span>
+              <strong>Protection {protectionState}:</strong> {status.state_reason}
+            </span>
+          </div>
+        )}
         {error && (
           <div className="banner banner-error">
             <strong>Error:</strong> {error}
@@ -872,8 +899,14 @@ export default function App() {
                 <div style={{ padding: 14, background: "var(--bg)", borderRadius: 8, border: "1px solid var(--border)" }}>
                   <div className="metric-label">Linux Fanotify Kernel Blocking</div>
                   <div className="row" style={{ marginTop: 8 }}>
-                    <span className={`pulse-dot ${kernelBlockingSupported ? "online" : "offline"}`} />
-                    <strong>{kernelBlockingSupported ? "Active (FAN_OPEN_PERM & EXEC_PERM)" : "Unavailable (Requires CAP_SYS_ADMIN)"}</strong>
+                    <span className={`pulse-dot ${isFanotifyActive ? "online" : kernelBlockingSupported ? "standby" : "offline"}`} />
+                    <strong>
+                      {isFanotifyActive
+                        ? "Active (Kernel Interception Enforcing)"
+                        : kernelBlockingSupported
+                        ? "Standby (Capable, Monitor Inactive)"
+                        : "Unavailable (Requires CAP_SYS_ADMIN)"}
+                    </strong>
                   </div>
                   <div style={{ fontSize: "0.8rem", color: "var(--muted)", marginTop: 6 }}>
                     Intercepts execution before syscall return in the Linux kernel.

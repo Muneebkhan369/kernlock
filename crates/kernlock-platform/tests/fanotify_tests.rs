@@ -283,7 +283,7 @@ fn test_privileged_linux_fanotify_execution_blocking() {
             bc.fetch_add(1, Ordering::SeqCst);
         };
 
-        monitor.start(vault_dir, get_policy, rules, on_threat);
+        monitor.start(vault_dir.clone(), get_policy, rules.clone(), on_threat);
         assert_eq!(
             FanotifyPermissionMonitor::global_health().0,
             FanotifyMonitorHealth::Running
@@ -355,8 +355,62 @@ fn test_privileged_linux_fanotify_execution_blocking() {
             FanotifyPermissionMonitor::global_health().0,
             FanotifyMonitorHealth::Stopped
         );
+
+        // 3. Restart and Error Recovery Verification
+        // Re-initialize monitor on test_dir to verify clean stop/restart cycle
+        let restarted_monitor = FanotifyPermissionMonitor::init_with_target(Some(&test_dir))
+            .expect("Fanotify monitor must successfully re-initialize after stop");
+        let bc2 = blocked_count.clone();
+        let on_threat2 = move |_event: kernlock_core::SecurityEvent,
+                               _alert: kernlock_core::ThreatAlert| {
+            bc2.fetch_add(1, Ordering::SeqCst);
+        };
+        let get_policy2 = {
+            let p = policy.clone();
+            Arc::new(move || (*p).clone())
+        };
+
+        restarted_monitor.start(vault_dir.clone(), get_policy2, rules.clone(), on_threat2);
+        assert_eq!(
+            FanotifyPermissionMonitor::global_health().0,
+            FanotifyMonitorHealth::Running,
+            "Restarted monitor health must transition back to Running"
+        );
+
+        // Verify benign script still runs after restart
+        let clean_res2 = std::process::Command::new(&clean_script).status();
+        assert!(clean_res2.is_ok() && clean_res2.unwrap().success());
+
+        // Verify malicious script is blocked again after restart
+        let malicious_res2 = std::process::Command::new(&malicious_script).status();
+        assert!(malicious_res2.is_err());
+        assert_eq!(
+            malicious_res2.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "Expected OS PermissionDenied (EPERM) error when execution is blocked after restart"
+        );
+        assert!(
+            blocked_count.load(Ordering::SeqCst) >= 2,
+            "Threat callback must have incremented blocked_count again after restart"
+        );
+
+        // Stop restarted monitor
+        restarted_monitor.stop();
+        assert_eq!(
+            FanotifyPermissionMonitor::global_health().0,
+            FanotifyMonitorHealth::Stopped
+        );
+
+        // 4. Error Recovery: verify graceful failure when initializing invalid or unmountable target
+        let non_existent_dir = tmp.path().join("non_existent_subdir");
+        let err_init = FanotifyPermissionMonitor::init_with_target(Some(&non_existent_dir));
+        assert!(
+            err_init.is_err(),
+            "init_with_target on non-existent path must fail cleanly without panicking"
+        );
+
         println!(
-            "[PASSED] privileged fanotify test: real execution blocking and clean execution verified"
+            "[PASSED] privileged fanotify test: real execution blocking, stop/restart and error recovery verified"
         );
     }
 }
