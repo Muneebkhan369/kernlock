@@ -262,7 +262,7 @@ impl MinifilterClient {
     }
 
     /// Update runtime policy mode in the kernel driver via FilterSendMessage
-    pub fn update_policy_mode(&self, _mode: SecurityMode) {
+    pub fn update_policy_mode(&self, mode: SecurityMode) {
         #[cfg(target_os = "windows")]
         {
             if let Ok(guard) = self.active_port.lock() {
@@ -285,6 +285,10 @@ impl MinifilterClient {
                     }
                 }
             }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = mode;
         }
     }
 
@@ -751,7 +755,7 @@ impl MinifilterClient {
                 let port_name_wide: Vec<u16> =
                     FILTER_PORT_NAME.encode_utf16().chain(Some(0)).collect();
 
-                let mut last_synced_mode: Option<SecurityMode> = None;
+                let mut last_synced_mode: Option<SecurityMode>;
 
                 loop {
                     let mut h_port: flt_ffi::HANDLE = std::ptr::null_mut();
