@@ -195,6 +195,13 @@ jobs:
           $driverDir = Split-Path $driver.FullName
           Write-Host "Creating local self-signed code signing certificate for test driver package..."
           $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=KernLock Security Test Driver" -CertStoreLocation "Cert:\CurrentUser\My"
+          $certPath = "$env:TEMP\kernlock_test.cer"
+          Export-Certificate -Cert $cert -FilePath $certPath | Out-Null
+          Import-Certificate -FilePath $certPath -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
+          Import-Certificate -FilePath $certPath -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
+          Import-Certificate -FilePath $certPath -CertStoreLocation "Cert:\LocalMachine\Root" -ErrorAction SilentlyContinue | Out-Null
+          Import-Certificate -FilePath $certPath -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" -ErrorAction SilentlyContinue | Out-Null
+          Write-Host "Installed test certificate into CurrentUser Root and TrustedPublisher stores"
           $signTool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
           if (!$signTool) {
             $signTool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*\x64\*" } | Select-Object -ExpandProperty FullName -First 1
