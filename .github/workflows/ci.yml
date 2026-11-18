@@ -197,11 +197,11 @@ jobs:
           $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=KernLock Security Test Driver" -CertStoreLocation "Cert:\CurrentUser\My"
           $certPath = "$env:TEMP\kernlock_test.cer"
           Export-Certificate -Cert $cert -FilePath $certPath | Out-Null
-          Import-Certificate -FilePath $certPath -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
-          Import-Certificate -FilePath $certPath -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
-          Import-Certificate -FilePath $certPath -CertStoreLocation "Cert:\LocalMachine\Root" -ErrorAction SilentlyContinue | Out-Null
-          Import-Certificate -FilePath $certPath -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" -ErrorAction SilentlyContinue | Out-Null
-          Write-Host "Installed test certificate into CurrentUser Root and TrustedPublisher stores"
+          certutil.exe -addstore -f Root "$certPath"
+          certutil.exe -addstore -f TrustedPublisher "$certPath"
+          certutil.exe -user -addstore -f Root "$certPath"
+          certutil.exe -user -addstore -f TrustedPublisher "$certPath"
+          Write-Host "Installed test certificate into Root and TrustedPublisher stores via certutil"
           $signTool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
           if (!$signTool) {
             $signTool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*\x64\*" } | Select-Object -ExpandProperty FullName -First 1
@@ -221,8 +221,18 @@ jobs:
           & $signTool sign /v /s My /n "KernLock Security Test Driver" /fd SHA256 $catFile
 
           Write-Host "Verifying test signatures on SYS and CAT..."
-          & $signTool verify /pa /v "$($driver.FullName)"
-          & $signTool verify /pa /v $catFile
+          $sysVerify = & $signTool verify /pa /v "$($driver.FullName)" 2>&1
+          Write-Host ($sysVerify -join "`n")
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Verifying SYS with explicit root subject..."
+            & $signTool verify /pa /r "KernLock Security Test Driver" /v "$($driver.FullName)"
+          }
+          $catVerify = & $signTool verify /pa /v $catFile 2>&1
+          Write-Host ($catVerify -join "`n")
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Verifying CAT with explicit root subject..."
+            & $signTool verify /pa /r "KernLock Security Test Driver" /v $catFile
+          }
           Write-Host "Verified test signatures successfully!"
           Write-Host "NOTE: This package is test-signed for local development with 'bcdedit /set testsigning on'."
           Write-Host "Production deployment requires Microsoft WHQL attestation signing."
