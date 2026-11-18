@@ -1,8 +1,8 @@
 use crate::{hostname_string, PlatformError, PlatformSecurityProvider};
 use kernlock_core::analyzer::analyze_file_bytes;
 use kernlock_core::models::{
-    CapabilityStatus, FileScanResult, PersistenceEntry, PlatformCapabilities, PolicyConfig,
-    ProcessInfo, SecurityMode,
+    CapabilityStatus, FileScanResult, PersistenceEntry, PlatformCapabilities,
+    PlatformRuntimeStatus, PolicyConfig, ProcessInfo, SecurityMode,
 };
 use kernlock_core::rules::RuleEngine;
 use serde::{Deserialize, Serialize};
@@ -120,9 +120,21 @@ impl EndpointSecurityClient {
         }
     }
 
-    /// Probe whether ESF client is authorized and actively enforcing
+    /// Probe whether ESF client is authorized and actively enforcing with heartbeat expiry
     pub fn probe_status(&self) -> EndpointSecurityStatus {
-        if let Ok(guard) = self.health.read() {
+        if let Ok(mut guard) = self.health.write() {
+            if guard.status == EndpointSecurityStatus::Active {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if guard.last_heartbeat_timestamp > 0
+                    && now.saturating_sub(guard.last_heartbeat_timestamp) > 15
+                {
+                    guard.is_alive = false;
+                    guard.status = EndpointSecurityStatus::Failed;
+                }
+            }
             guard.status
         } else {
             EndpointSecurityStatus::Failed
@@ -270,6 +282,73 @@ impl PlatformSecurityProvider for MacOsSecurityProvider {
             active_mode,
             fallback_reason,
             capabilities,
+        }
+    }
+
+    fn runtime_enforcement_status(&self, requested_mode: SecurityMode) -> PlatformRuntimeStatus {
+        let es_status = self.es_client.probe_status();
+        let (protection_state, monitor_health, state_reason) = match es_status {
+            EndpointSecurityStatus::NotInstalled => (
+                "Unavailable".to_string(),
+                "Unavailable".to_string(),
+                Some("Apple EndpointSecurity System Extension is not installed.".to_string()),
+            ),
+            EndpointSecurityStatus::AwaitingApproval => (
+                "Degraded".to_string(),
+                "Standby".to_string(),
+                Some("System Extension awaiting user approval in System Settings -> Privacy & Security.".to_string()),
+            ),
+            EndpointSecurityStatus::NotPermitted => (
+                "Unavailable".to_string(),
+                "Failed".to_string(),
+                Some("Missing Full Disk Access (FDA) permission in System Settings.".to_string()),
+            ),
+            EndpointSecurityStatus::NotEntitled => (
+                "Unavailable".to_string(),
+                "Failed".to_string(),
+                Some("Missing com.apple.developer.endpoint-security.client entitlement.".to_string()),
+            ),
+            EndpointSecurityStatus::Failed => (
+                "Failed".to_string(),
+                "Failed".to_string(),
+                Some("Endpoint Security client crashed, disconnected, or heartbeat expired.".to_string()),
+            ),
+            EndpointSecurityStatus::Active => {
+                if requested_mode == SecurityMode::Audit {
+                    (
+                        "Degraded".to_string(),
+                        "Running".to_string(),
+                        Some("EndpointSecurity client active; Audit mode active (observing without blocking).".to_string()),
+                    )
+                } else {
+                    (
+                        "Active".to_string(),
+                        "Running".to_string(),
+                        Some("Apple EndpointSecurity client active and enforcing pre-execution AUTH_EXEC verdicts.".to_string()),
+                    )
+                }
+            }
+        };
+
+        PlatformRuntimeStatus {
+            protection_state,
+            monitor_health,
+            state_reason,
+            platform_name: "macOS".to_string(),
+            enforcement_mechanism: "endpoint_security".to_string(),
+        }
+    }
+
+    fn record_heartbeat(&self, client: &str, pid: i32, status: &str) {
+        if client == "endpoint_security" {
+            let es_status = match status {
+                "active" => EndpointSecurityStatus::Active,
+                "awaiting_approval" => EndpointSecurityStatus::AwaitingApproval,
+                "not_permitted" => EndpointSecurityStatus::NotPermitted,
+                "not_entitled" => EndpointSecurityStatus::NotEntitled,
+                _ => EndpointSecurityStatus::Failed,
+            };
+            self.es_client.record_native_heartbeat(pid, es_status);
         }
     }
 

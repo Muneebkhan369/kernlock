@@ -261,6 +261,15 @@ pub struct CapabilityStatus {
     pub details: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformRuntimeStatus {
+    pub protection_state: String,
+    pub monitor_health: String,
+    pub state_reason: Option<String>,
+    pub platform_name: String,
+    pub enforcement_mechanism: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlatformCapabilities {
     pub os: String,

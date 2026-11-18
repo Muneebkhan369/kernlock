@@ -193,6 +193,55 @@ static int is_deadline_imminent(const es_message_t *message) {
 }
 
 /**
+ * Send periodic heartbeat to user-mode daemon to confirm native client health.
+ */
+static void send_daemon_heartbeat(void) {
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) return;
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 500000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, KERNLOCK_DAEMON_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(sock);
+        return;
+    }
+
+    char heartbeat_json[256];
+    snprintf(heartbeat_json, sizeof(heartbeat_json),
+             "{\"action\":\"heartbeat\",\"client\":\"endpoint_security\",\"pid\":%d,\"status\":\"active\"}\n",
+             getpid());
+
+    ssize_t w = write(sock, heartbeat_json, strlen(heartbeat_json));
+    (void)w;
+    char resp[128];
+    ssize_t r = read(sock, resp, sizeof(resp) - 1);
+    (void)r;
+    close(sock);
+}
+
+static void start_heartbeat_timer(void) {
+    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    if (timer != NULL) {
+        // Fire immediately, then every 5 seconds
+        dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), 5ULL * NSEC_PER_SEC, 500ULL * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(timer, ^{
+            send_daemon_heartbeat();
+        });
+        dispatch_resume(timer);
+    }
+}
+
+/**
  * Handle ES_EVENT_TYPE_AUTH_EXEC
  */
 static void handle_auth_exec(es_client_t *client, const es_message_t *message) {
@@ -336,6 +385,7 @@ int main(int argc, const char * argv[]) {
     }
 
     printf("[KernLock ES] Client active and monitoring execution and file open authorization events.\n");
+    start_heartbeat_timer();
     dispatch_main();
     return 0;
 }

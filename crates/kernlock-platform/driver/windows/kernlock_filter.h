@@ -16,8 +16,15 @@ typedef enum _EXECUTION_VERDICT {
 } EXECUTION_VERDICT;
 
 typedef struct _KERNLOCK_PORT_CONTEXT {
+    unsigned long Version;    // Context version: 1
     unsigned long StrictMode; // 1 for Strict mode (fail-closed on disconnect/timeout), 0 for Protection/Audit
+    unsigned long Reserved;
 } KERNLOCK_PORT_CONTEXT, *PKERNLOCK_PORT_CONTEXT;
+
+typedef struct _KERNLOCK_POLICY_UPDATE_MSG {
+    unsigned long MessageType; // 1 = PolicyUpdate
+    unsigned long StrictMode;  // 1 = Strict, 0 = Protection/Audit
+} KERNLOCK_POLICY_UPDATE_MSG, *PKERNLOCK_POLICY_UPDATE_MSG;
 
 #pragma pack(push, 1)
 

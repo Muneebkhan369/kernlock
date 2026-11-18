@@ -330,13 +330,31 @@ export default function App() {
 
   const openAlertsCount = alerts.filter((a) => a.status === "open").length;
   const criticalCount = alerts.filter((a) => a.status === "open" && a.severity === "critical").length;
-  const isFanotifyActive = status?.fanotify_active ?? false;
+  const isKernelEnforcing = status?.protection_state === "Active";
   const kernelBlockingSupported = status?.capabilities?.kernel_blocking_available ?? false;
   const protectionState = status?.protection_state ?? (
-    isFanotifyActive
+    isKernelEnforcing
       ? (status?.policy?.mode === "audit" ? "Degraded" : "Active")
       : (status?.watcher_active ? "Degraded" : "Unavailable")
   );
+
+  const platformName = status?.platform_name || (status?.capabilities?.os === "windows" ? "Windows" : status?.capabilities?.os === "macos" ? "macOS" : "Linux");
+  const enforcementMechanism = status?.enforcement_mechanism || (platformName === "Windows" ? "fltmgr" : platformName === "macOS" ? "endpoint_security" : "fanotify");
+  const enforcementLabel = enforcementMechanism === "fltmgr"
+    ? "Windows Minifilter Driver (FLTMGR)"
+    : enforcementMechanism === "endpoint_security"
+    ? "Apple EndpointSecurity Framework (ESF)"
+    : "Linux Fanotify Kernel Blocking";
+  const enforcementDesc = enforcementMechanism === "fltmgr"
+    ? "Filter Manager pre-operation execution callback interception (kernlock_filter.sys)."
+    : enforcementMechanism === "endpoint_security"
+    ? "Apple Endpoint Security AUTH_EXEC pre-launch authorization interception."
+    : "Intercepts execution before syscall return in the Linux kernel.";
+  const fallbackLabel = enforcementMechanism === "fltmgr"
+    ? "Unavailable (Requires loaded driver & test-signing)"
+    : enforcementMechanism === "endpoint_security"
+    ? "Unavailable (Requires System Extension approval & Full Disk Access)"
+    : "Unavailable (Requires CAP_SYS_ADMIN/root)";
 
   return (
     <div className="app-shell">
@@ -897,19 +915,19 @@ export default function App() {
               <h3>Real-Time Enforcement Status</h3>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 14 }}>
                 <div style={{ padding: 14, background: "var(--bg)", borderRadius: 8, border: "1px solid var(--border)" }}>
-                  <div className="metric-label">Linux Fanotify Kernel Blocking</div>
+                  <div className="metric-label">{enforcementLabel}</div>
                   <div className="row" style={{ marginTop: 8 }}>
-                    <span className={`pulse-dot ${isFanotifyActive ? "online" : kernelBlockingSupported ? "standby" : "offline"}`} />
+                    <span className={`pulse-dot ${isKernelEnforcing ? "online" : kernelBlockingSupported ? "standby" : "offline"}`} />
                     <strong>
-                      {isFanotifyActive
+                      {isKernelEnforcing
                         ? "Active (Kernel Interception Enforcing)"
                         : kernelBlockingSupported
                         ? "Standby (Capable, Monitor Inactive)"
-                        : "Unavailable (Requires CAP_SYS_ADMIN)"}
+                        : fallbackLabel}
                     </strong>
                   </div>
                   <div style={{ fontSize: "0.8rem", color: "var(--muted)", marginTop: 6 }}>
-                    Intercepts execution before syscall return in the Linux kernel.
+                    {enforcementDesc}
                   </div>
                 </div>
 

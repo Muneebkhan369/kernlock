@@ -147,16 +147,42 @@ jobs:
             Copy-Item "crates/kernlock-platform/driver/windows/kernlock_filter.inf" $infFile
           }
           Write-Host "Verifying INF at: $infFile"
+
+          # 1. Locate and run InfVerif
+          $infVerif = (Get-Command infverif.exe -ErrorAction SilentlyContinue).Source
+          if (!$infVerif) {
+            $infVerif = Get-ChildItem "crates/kernlock-platform/driver/windows/packages/Microsoft.Windows.WDK.x64.*" -Recurse -Filter infverif.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*\x64\*" } | Select-Object -ExpandProperty FullName -First 1
+          }
+          if (!$infVerif) {
+            $infVerif = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter infverif.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*\x64\*" } | Select-Object -ExpandProperty FullName -First 1
+          }
+          if ($infVerif) {
+            Write-Host "Running InfVerif: $infVerif /v $infFile"
+            & $infVerif /v $infFile
+          } else {
+            Write-Warning "InfVerif not found in package/system paths"
+          }
+
+          # 2. Locate and run Inf2Cat
           $inf2cat = (Get-Command inf2cat.exe -ErrorAction SilentlyContinue).Source
+          if (!$inf2cat) {
+            $inf2cat = Get-ChildItem "crates/kernlock-platform/driver/windows/packages/Microsoft.Windows.WDK.x64.*" -Recurse -Filter inf2cat.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+          }
           if (!$inf2cat) {
             $inf2cat = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter inf2cat.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
           }
-          if ($inf2cat) {
-            Write-Host "Running Inf2Cat: $inf2cat"
-            & $inf2cat /driver:$driverDir /os:10_X64
-          } else {
-            Write-Warning "Inf2Cat not found in default paths; skipping catalog generation"
+          if (!$inf2cat) {
+            Write-Error "ERROR: Inf2Cat tool not found; catalog generation cannot proceed"
+            exit 1
           }
+          Write-Host "Running Inf2Cat: $inf2cat"
+          & $inf2cat /driver:$driverDir /os:10_X64
+          $catFile = Join-Path $driverDir "kernlock_filter.cat"
+          if (!(Test-Path $catFile)) {
+            Write-Error "ERROR: Catalog file was not generated at $catFile"
+            exit 1
+          }
+          Write-Host "Verified catalog generated at: $catFile"
 
       - name: Create Test Certificate and Test-Sign Driver
         shell: pwsh
@@ -167,7 +193,7 @@ jobs:
           }
           $driver = $driverFiles[0]
           $driverDir = Split-Path $driver.FullName
-          Write-Host "Creating local self-signed code signing certificate for test driver..."
+          Write-Host "Creating local self-signed code signing certificate for test driver package..."
           $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=KernLock Security Test Driver" -CertStoreLocation "Cert:\CurrentUser\My"
           $signTool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
           if (!$signTool) {
@@ -176,18 +202,23 @@ jobs:
           if (!$signTool) {
             $signTool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "*\arm*" } | Select-Object -ExpandProperty FullName -First 1
           }
-          if ($signTool) {
-            Write-Host "Found signtool: $signTool"
-            Write-Host "Signing driver binary ($($driver.FullName))..."
-            & $signTool sign /v /s My /n "KernLock Security Test Driver" /fd SHA256 "$($driver.FullName)"
-            $catFile = Join-Path $driverDir "kernlock_filter.cat"
-            if (Test-Path $catFile) {
-              Write-Host "Signing catalog ($catFile)..."
-              & $signTool sign /v /s My /n "KernLock Security Test Driver" /fd SHA256 $catFile
-            }
-          } else {
-            Write-Warning "signtool.exe not found in default paths; skipping test-signing"
+          if (!$signTool) {
+            Write-Error "ERROR: signtool.exe not found!"
+            exit 1
           }
+          Write-Host "Found signtool: $signTool"
+          Write-Host "Signing driver binary ($($driver.FullName))..."
+          & $signTool sign /v /s My /n "KernLock Security Test Driver" /fd SHA256 "$($driver.FullName)"
+          $catFile = Join-Path $driverDir "kernlock_filter.cat"
+          Write-Host "Signing catalog ($catFile)..."
+          & $signTool sign /v /s My /n "KernLock Security Test Driver" /fd SHA256 $catFile
+
+          Write-Host "Verifying test signatures on SYS and CAT..."
+          & $signTool verify /pa /v "$($driver.FullName)"
+          & $signTool verify /pa /v $catFile
+          Write-Host "Verified test signatures successfully!"
+          Write-Host "NOTE: This package is test-signed for local development with 'bcdedit /set testsigning on'."
+          Write-Host "Production deployment requires Microsoft WHQL attestation signing."
 
       - name: Upload Windows Minifilter Driver Artifacts
         uses: actions/upload-artifact@v4
@@ -233,9 +264,8 @@ jobs:
           xcodebuild -project crates/kernlock-platform/extension/macos/KernLockExtension.xcodeproj \
             -target KernLockExtension \
             -configuration Release \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_ENTITLEMENTS=""
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO
 
       - name: Verify macOS System Extension binary exists
         run: |
@@ -258,7 +288,7 @@ jobs:
             echo "ERROR: Missing com.apple.developer.endpoint-security.client entitlement in $ENT_FILE"
             exit 1
           fi
-          echo "Endpoint Security entitlement verified in $ENT_FILE"
+          echo "Endpoint Security entitlement verified in source $ENT_FILE"
           EXT_PATH=$(find . -name "*.systemextension" | head -n 1)
           if [ -z "$EXT_PATH" ]; then
             echo "ERROR: System extension bundle not found!"
@@ -270,6 +300,20 @@ jobs:
             exit 1
           fi
           ls -la "$EXT_PATH/Contents/MacOS"
+
+          # Sign bundle with verified entitlements using ad-hoc signature for validation
+          echo "Signing built extension with ad-hoc signature and embedded entitlements..."
+          codesign --force --sign - --entitlements "$ENT_FILE" "$EXT_PATH"
+
+          # Inspect actual signed entitlements via codesign
+          echo "Inspecting embedded entitlements using codesign..."
+          SIGNED_ENTS=$(codesign -d --entitlements :- "$EXT_PATH" 2>&1)
+          echo "$SIGNED_ENTS"
+          if ! echo "$SIGNED_ENTS" | grep -q "com.apple.developer.endpoint-security.client"; then
+            echo "ERROR: com.apple.developer.endpoint-security.client entitlement not present in signed extension bundle!"
+            exit 1
+          fi
+          echo "Verified embedded Endpoint Security entitlement via codesign inspection!"
 
       - name: Upload macOS Endpoint Security Artifacts
         uses: actions/upload-artifact@v4

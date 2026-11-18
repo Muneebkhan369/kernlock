@@ -2,7 +2,8 @@ use crate::{hostname_string, PlatformError, PlatformSecurityProvider};
 use kernlock_core::analyzer::analyze_file_bytes;
 use kernlock_core::models::{
     AlertStatus, CapabilityStatus, EventCategory, FileScanResult, PersistenceEntry,
-    PlatformCapabilities, PolicyConfig, ProcessInfo, SecurityEvent, SecurityMode, ThreatAlert,
+    PlatformCapabilities, PlatformRuntimeStatus, PolicyConfig, ProcessInfo, SecurityEvent,
+    SecurityMode, ThreatAlert,
 };
 use kernlock_core::rules::RuleEngine;
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,21 @@ pub enum ExecutionVerdict {
     Allow = 0,
     Block = 1,
     Audit = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernlockPortContext {
+    pub version: u32,
+    pub strict_mode: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernlockPolicyUpdateMsg {
+    pub message_type: u32,
+    pub strict_mode: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +223,15 @@ mod flt_ffi {
             dwReplyBufferSize: u32,
         ) -> HRESULT;
 
+        pub fn FilterSendMessage(
+            hPort: HANDLE,
+            lpInBuffer: *const c_void,
+            dwInBufferSize: u32,
+            lpOutBuffer: *mut c_void,
+            dwOutBufferSize: u32,
+            lpBytesReturned: *mut u32,
+        ) -> HRESULT;
+
         pub fn FilterClose(hFilter: HANDLE) -> HRESULT;
     }
 
@@ -224,12 +249,42 @@ mod flt_ffi {
 #[derive(Debug, Clone)]
 pub struct MinifilterClient {
     connected: Arc<AtomicBool>,
+    #[allow(dead_code)]
+    active_port: Arc<std::sync::Mutex<Option<usize>>>,
 }
 
 impl MinifilterClient {
     pub fn new() -> Self {
         Self {
             connected: Arc::new(AtomicBool::new(false)),
+            active_port: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Update runtime policy mode in the kernel driver via FilterSendMessage
+    pub fn update_policy_mode(&self, _mode: SecurityMode) {
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(guard) = self.active_port.lock() {
+                if let Some(port_addr) = *guard {
+                    let h_port = port_addr as flt_ffi::HANDLE;
+                    let msg = KernlockPolicyUpdateMsg {
+                        message_type: 1,
+                        strict_mode: if mode == SecurityMode::Strict { 1 } else { 0 },
+                    };
+                    let mut bytes_returned: u32 = 0;
+                    unsafe {
+                        flt_ffi::FilterSendMessage(
+                            h_port,
+                            &msg as *const _ as *const std::ffi::c_void,
+                            std::mem::size_of::<KernlockPolicyUpdateMsg>() as u32,
+                            std::ptr::null_mut(),
+                            0,
+                            &mut bytes_returned,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -241,16 +296,21 @@ impl MinifilterClient {
                 return MinifilterDriverStatus::Connected;
             }
 
-            // Attempt a temporary non-blocking probe connection
+            // Attempt a temporary non-blocking probe connection with versioned context
             let port_name_wide: Vec<u16> = FILTER_PORT_NAME.encode_utf16().chain(Some(0)).collect();
             let mut h_port: flt_ffi::HANDLE = std::ptr::null_mut();
+            let probe_ctx = KernlockPortContext {
+                version: 1,
+                strict_mode: 0,
+                reserved: 0,
+            };
 
             let hr = unsafe {
                 flt_ffi::FilterConnectCommunicationPort(
                     port_name_wide.as_ptr(),
                     0,
-                    std::ptr::null(),
-                    0,
+                    &probe_ctx as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<KernlockPortContext>() as u16,
                     std::ptr::null_mut(),
                     &mut h_port,
                 )
@@ -317,22 +377,33 @@ impl MinifilterClient {
             #[cfg(target_os = "windows")]
             let mut file = {
                 use std::os::windows::fs::OpenOptionsExt;
-                // Never pass FILE_SHARE_DELETE: lock out concurrent file replacement during scan
+                // In Strict mode, open with share_mode = 1 (FILE_SHARE_READ only).
+                // This locks out concurrent writers, preventing in-place modification during scanning.
+                let share_mode = if policy.mode == SecurityMode::Strict {
+                    1 // FILE_SHARE_READ only
+                } else {
+                    3 // FILE_SHARE_READ | FILE_SHARE_WRITE
+                };
                 fs::OpenOptions::new()
                     .read(true)
-                    .share_mode(3) // FILE_SHARE_READ | FILE_SHARE_WRITE
+                    .share_mode(share_mode)
                     .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS
                     .open(&path)
-                    .map_err(|e| format!("Failed to open file: {}", e))?
+                    .map_err(|e| {
+                        format!(
+                            "Failed to open file for secure scan (share mode {}): {}",
+                            share_mode, e
+                        )
+                    })?
             };
             #[cfg(not(target_os = "windows"))]
             let mut file =
                 fs::File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
 
-            let meta = file
+            let meta_before = file
                 .metadata()
-                .map_err(|e| format!("Failed to read metadata: {}", e))?;
-            if !meta.is_file() {
+                .map_err(|e| format!("Failed to read metadata before scan: {}", e))?;
+            if !meta_before.is_file() {
                 return Err("Target is not a regular file".to_string());
             }
 
@@ -345,8 +416,28 @@ impl MinifilterClient {
                 &file_path_str,
             )?;
 
-            kernlock_core::analyzer::scan_stream_reader(&mut file, &file_path_str, rules, policy)
-                .map_err(|e| format!("Scan error: {}", e))
+            let scan_result = kernlock_core::analyzer::scan_stream_reader(
+                &mut file,
+                &file_path_str,
+                rules,
+                policy,
+            )
+            .map_err(|e| format!("Scan error: {}", e))?;
+
+            // Post-scan content TOCTOU verification: ensure file size was not modified during scan
+            let meta_after = file
+                .metadata()
+                .map_err(|e| format!("Failed to read metadata after scan: {}", e))?;
+            if meta_before.len() != meta_after.len() {
+                return Err(format!(
+                    "TOCTOU race detected: file size changed during scan (was {} bytes, now {} bytes) for {}",
+                    meta_before.len(),
+                    meta_after.len(),
+                    file_path_str
+                ));
+            }
+
+            Ok(scan_result)
         })();
 
         match scan_outcome {
@@ -492,8 +583,20 @@ impl MinifilterClient {
                 ((info.n_file_index_high as u64) << 32) | (info.n_file_index_low as u64);
             let opened_volume_serial = info.dw_volume_serial_number;
 
-            // 1. Verify volume identity (must match if provided by kernel)
-            if expected_volume_serial != 0 && opened_volume_serial != expected_volume_serial {
+            // 1. Verify volume identity (must match if provided by kernel; zero rejected in Strict mode)
+            if expected_volume_serial == 0 {
+                if mode == SecurityMode::Strict {
+                    return Err(format!(
+                        "Unverified file handle: Kernel Volume Serial Number is zero for {}; unverified volume identity rejected in Strict mode",
+                        file_path_str
+                    ));
+                } else {
+                    tracing::warn!(
+                        "Unverified file handle: Kernel Volume Serial Number is zero for {}; volume identity unverified in Permissive mode",
+                        file_path_str
+                    );
+                }
+            } else if opened_volume_serial != expected_volume_serial {
                 return Err(format!(
                     "TOCTOU race detected: opened volume serial 0x{:08X} does not match kernel volume serial 0x{:08X} for {}",
                     opened_volume_serial, expected_volume_serial, file_path_str
@@ -535,8 +638,19 @@ impl MinifilterClient {
                     let opened_volume_serial = meta.dev() as u32;
 
                     // 1. Verify volume identity
-                    if expected_volume_serial != 0 && opened_volume_serial != expected_volume_serial
-                    {
+                    if expected_volume_serial == 0 {
+                        if mode == SecurityMode::Strict {
+                            return Err(format!(
+                                "Unverified file handle: Kernel Volume Serial Number is zero for {}; unverified volume identity rejected in Strict mode",
+                                file_path_str
+                            ));
+                        } else {
+                            tracing::warn!(
+                                "Unverified file handle: Kernel Volume Serial Number is zero for {}; volume identity unverified in Permissive mode",
+                                file_path_str
+                            );
+                        }
+                    } else if opened_volume_serial != expected_volume_serial {
                         return Err(format!(
                             "TOCTOU race detected: opened volume serial 0x{:08X} does not match kernel volume serial 0x{:08X} for {}",
                             opened_volume_serial, expected_volume_serial, file_path_str
@@ -632,19 +746,32 @@ impl MinifilterClient {
         #[cfg(target_os = "windows")]
         {
             let connected = self.connected.clone();
+            let active_port = self.active_port.clone();
             std::thread::spawn(move || {
                 let port_name_wide: Vec<u16> =
                     FILTER_PORT_NAME.encode_utf16().chain(Some(0)).collect();
 
+                let mut last_synced_mode: Option<SecurityMode> = None;
+
                 loop {
                     let mut h_port: flt_ffi::HANDLE = std::ptr::null_mut();
+                    let current_policy = get_policy();
+                    let connect_ctx = KernlockPortContext {
+                        version: 1,
+                        strict_mode: if current_policy.mode == SecurityMode::Strict {
+                            1
+                        } else {
+                            0
+                        },
+                        reserved: 0,
+                    };
 
                     let hr = unsafe {
                         flt_ffi::FilterConnectCommunicationPort(
                             port_name_wide.as_ptr(),
                             0,
-                            std::ptr::null(),
-                            0,
+                            &connect_ctx as *const _ as *const std::ffi::c_void,
+                            std::mem::size_of::<KernlockPortContext>() as u16,
                             std::ptr::null_mut(),
                             &mut h_port,
                         )
@@ -652,14 +779,22 @@ impl MinifilterClient {
 
                     if hr != flt_ffi::S_OK || h_port.is_null() {
                         connected.store(false, Ordering::Release);
+                        if let Ok(mut guard) = active_port.lock() {
+                            *guard = None;
+                        }
                         std::thread::sleep(std::time::Duration::from_secs(3));
                         continue;
                     }
 
                     connected.store(true, Ordering::Release);
+                    last_synced_mode = Some(current_policy.mode);
+                    if let Ok(mut guard) = active_port.lock() {
+                        *guard = Some(h_port as usize);
+                    }
                     tracing::info!(
-                        "Connected to KernLock Windows Minifilter port (altitude {})",
-                        KERNLOCK_FILTER_ALTITUDE
+                        "Connected to KernLock Windows Minifilter port (altitude {}) with StrictMode={}",
+                        KERNLOCK_FILTER_ALTITUDE,
+                        connect_ctx.strict_mode
                     );
 
                     let mut msg: FilterMessage<RawExecutionRequestMsg> =
@@ -696,6 +831,29 @@ impl MinifilterClient {
                         }
 
                         let policy = get_policy();
+                        // Dynamic policy sync: update driver if mode changed after initial handshake
+                        if last_synced_mode != Some(policy.mode) {
+                            last_synced_mode = Some(policy.mode);
+                            let update_msg = KernlockPolicyUpdateMsg {
+                                message_type: 1,
+                                strict_mode: if policy.mode == SecurityMode::Strict {
+                                    1
+                                } else {
+                                    0
+                                },
+                            };
+                            let mut bytes_ret: u32 = 0;
+                            unsafe {
+                                flt_ffi::FilterSendMessage(
+                                    h_port,
+                                    &update_msg as *const _ as *const std::ffi::c_void,
+                                    std::mem::size_of::<KernlockPolicyUpdateMsg>() as u32,
+                                    std::ptr::null_mut(),
+                                    0,
+                                    &mut bytes_ret,
+                                );
+                            }
+                        }
                         let raw_reply_data =
                             Self::new().evaluate_request(&msg.data, &rules, &policy, &on_threat);
 
@@ -851,6 +1009,50 @@ impl PlatformSecurityProvider for WindowsSecurityProvider {
             active_mode,
             fallback_reason,
             capabilities,
+        }
+    }
+
+    fn runtime_enforcement_status(&self, requested_mode: SecurityMode) -> PlatformRuntimeStatus {
+        let driver_status = self.minifilter.probe_status();
+        let (protection_state, monitor_health, state_reason) = match driver_status {
+            MinifilterDriverStatus::NotInstalled => (
+                "Unavailable".to_string(),
+                "Unavailable".to_string(),
+                Some("Windows Minifilter driver (kernlock_filter.sys) is not installed or running. Requires loaded driver with test-signing enabled.".to_string()),
+            ),
+            MinifilterDriverStatus::InstalledNotRunning => (
+                "Degraded".to_string(),
+                "Stopped".to_string(),
+                Some("Windows Minifilter driver is loaded but not connected to daemon communication port.".to_string()),
+            ),
+            MinifilterDriverStatus::CommunicationError => (
+                "Failed".to_string(),
+                "Failed".to_string(),
+                Some("Filter Manager communication error with kernlock_filter.sys".to_string()),
+            ),
+            MinifilterDriverStatus::Connected => {
+                if requested_mode == SecurityMode::Audit {
+                    (
+                        "Degraded".to_string(),
+                        "Running".to_string(),
+                        Some("Windows Minifilter connected; Audit mode active (observing without blocking).".to_string()),
+                    )
+                } else {
+                    (
+                        "Active".to_string(),
+                        "Running".to_string(),
+                        Some("Windows Minifilter active and enforcing pre-execution verdicts via FLTMGR.".to_string()),
+                    )
+                }
+            }
+        };
+
+        PlatformRuntimeStatus {
+            protection_state,
+            monitor_health,
+            state_reason,
+            platform_name: "Windows".to_string(),
+            enforcement_mechanism: "fltmgr".to_string(),
         }
     }
 

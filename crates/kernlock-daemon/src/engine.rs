@@ -316,6 +316,28 @@ impl KernLockEngine {
         }
     }
 
+    pub fn inject_fanotify_monitor_for_testing(
+        &self,
+        monitor: kernlock_platform::fanotify::FanotifyPermissionMonitor,
+    ) {
+        if let Ok(mut guard) = self.fanotify_monitor.lock() {
+            *guard = Some(monitor);
+        }
+    }
+
+    pub fn runtime_status(&self) -> kernlock_core::PlatformRuntimeStatus {
+        let policy = self.storage.get_policy().unwrap_or_default();
+        let (protection_state, monitor_health, state_reason) = self.get_protection_state();
+        let provider_status = self.provider.runtime_enforcement_status(policy.mode);
+        kernlock_core::PlatformRuntimeStatus {
+            protection_state,
+            monitor_health,
+            state_reason,
+            platform_name: provider_status.platform_name,
+            enforcement_mechanism: provider_status.enforcement_mechanism,
+        }
+    }
+
     pub fn get_protection_state(&self) -> (String, String, Option<String>) {
         let policy = self.storage.get_policy().unwrap_or_default();
         let capabilities = self.capabilities();
@@ -323,72 +345,114 @@ impl KernLockEngine {
         let watcher_active = self.is_watcher_active();
         let f_health = self.fanotify_health();
 
-        // 1. Check for fatal kernel enforcement monitor failure
-        if f_health == kernlock_platform::fanotify::FanotifyMonitorHealth::Failed {
-            return (
-                "Failed".to_string(),
-                "Failed".to_string(),
-                Some(
-                    "Kernel execution blocking monitor encountered a fatal runtime error"
-                        .to_string(),
-                ),
-            );
-        }
+        #[cfg(target_os = "linux")]
+        {
+            // 1. Check for fatal kernel enforcement monitor failure
+            if f_health == kernlock_platform::fanotify::FanotifyMonitorHealth::Failed {
+                return (
+                    "Failed".to_string(),
+                    "Failed".to_string(),
+                    Some(
+                        "Kernel execution blocking monitor encountered a fatal runtime error"
+                            .to_string(),
+                    ),
+                );
+            }
 
-        // 2. Kernel blocking capability unavailable in this environment
-        if !capabilities.kernel_blocking_available || !capabilities.is_privileged {
-            if watcher_active {
+            // 2. Queue overflow / degraded state: MUST NEVER report Active!
+            if f_health == kernlock_platform::fanotify::FanotifyMonitorHealth::Degraded {
                 return (
                     "Degraded".to_string(),
                     "Degraded".to_string(),
                     Some(
-                        "Kernel blocking unavailable (requires CAP_SYS_ADMIN/root). Operating in degraded mode with user-space filesystem watcher."
+                        "Kernel event queue overflowed: some events were dropped; enforcement degraded"
                             .to_string(),
                     ),
                 );
-            } else {
-                return (
-                    "Unavailable".to_string(),
-                    "Unavailable".to_string(),
-                    capabilities.fallback_reason.clone().or_else(|| {
-                        Some("Kernel execution blocking is unavailable in this environment (missing privileges/driver)".to_string())
-                    }),
-                );
             }
-        }
 
-        // 3. Kernel blocking available and active
-        if fanotify_active {
-            if policy.mode == kernlock_core::SecurityMode::Audit {
+            // 3. Monitor stopped
+            if f_health == kernlock_platform::fanotify::FanotifyMonitorHealth::Stopped {
                 return (
                     "Degraded".to_string(),
-                    "Running".to_string(),
-                    Some("Audit Mode active: observing and logging without active kernel execution blocking.".to_string()),
+                    "Stopped".to_string(),
+                    Some("Kernel execution blocking monitor is stopped".to_string()),
                 );
+            }
+
+            // 4. Kernel blocking actively running
+            if fanotify_active
+                && f_health == kernlock_platform::fanotify::FanotifyMonitorHealth::Running
+            {
+                if policy.mode == kernlock_core::SecurityMode::Audit {
+                    return (
+                        "Degraded".to_string(),
+                        "Running".to_string(),
+                        Some("Audit Mode active: observing and logging without active kernel execution blocking.".to_string()),
+                    );
+                } else {
+                    return (
+                        "Active".to_string(),
+                        "Running".to_string(),
+                        Some("Kernel execution blocking active and enforcing.".to_string()),
+                    );
+                }
+            }
+
+            // 5. Kernel blocking capability unavailable in this environment
+            if !capabilities.kernel_blocking_available || !capabilities.is_privileged {
+                if watcher_active {
+                    return (
+                        "Degraded".to_string(),
+                        "Degraded".to_string(),
+                        Some(
+                            "Kernel blocking unavailable (requires CAP_SYS_ADMIN/root). Operating in degraded mode with user-space filesystem watcher."
+                                .to_string(),
+                        ),
+                    );
+                } else {
+                    return (
+                        "Unavailable".to_string(),
+                        "Unavailable".to_string(),
+                        capabilities.fallback_reason.clone().or_else(|| {
+                            Some("Kernel execution blocking is unavailable in this environment (missing privileges/driver)".to_string())
+                        }),
+                    );
+                }
+            }
+
+            // 6. Kernel blocking available but monitor in standby or uninitialized
+            if watcher_active {
+                (
+                    "Degraded".to_string(),
+                    "Degraded".to_string(),
+                    Some(
+                        "Kernel blocking monitor is standby; user-space filesystem watcher is active."
+                            .to_string(),
+                    ),
+                )
             } else {
-                return (
-                    "Active".to_string(),
-                    "Running".to_string(),
-                    Some("Kernel execution blocking active and enforcing.".to_string()),
-                );
+                let health_str = match f_health {
+                    kernlock_platform::fanotify::FanotifyMonitorHealth::Uninitialized => {
+                        "Uninitialized"
+                    }
+                    _ => "Standby",
+                };
+                (
+                    "Degraded".to_string(),
+                    health_str.to_string(),
+                    Some("Protection is in standby mode.".to_string()),
+                )
             }
         }
 
-        // 4. Kernel blocking available but monitor not running
-        if watcher_active {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let status = self.provider.runtime_enforcement_status(policy.mode);
             (
-                "Degraded".to_string(),
-                "Degraded".to_string(),
-                Some(
-                    "Kernel blocking monitor is standby; user-space filesystem watcher is active."
-                        .to_string(),
-                ),
-            )
-        } else {
-            (
-                "Degraded".to_string(),
-                "Standby".to_string(),
-                Some("Protection is in standby mode.".to_string()),
+                status.protection_state,
+                status.monitor_health,
+                status.state_reason,
             )
         }
     }
@@ -603,8 +667,8 @@ impl KernLockEngine {
 
                                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
                                 {
-                                    if val.get("action").and_then(|v| v.as_str()) == Some("eval_es")
-                                    {
+                                    let action = val.get("action").and_then(|v| v.as_str());
+                                    if action == Some("eval_es") {
                                         let path_str =
                                             val.get("path").and_then(|v| v.as_str()).unwrap_or("");
                                         let pid =
@@ -636,6 +700,25 @@ impl KernLockEngine {
                                             )
                                         };
                                         let _ = writer.write_all(resp.as_bytes()).await;
+                                        let _ = writer.flush().await;
+                                    } else if action == Some("heartbeat") {
+                                        let client = val
+                                            .get("client")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("endpoint_security");
+                                        let pid =
+                                            val.get("pid").and_then(|v| v.as_i64()).unwrap_or(0)
+                                                as i32;
+                                        let status = val
+                                            .get("status")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("active");
+                                        eng.provider.record_heartbeat(client, pid, status);
+                                        let _ = writer
+                                            .write_all(
+                                                b"{\"status\":\"ok\",\"acknowledged\":true}\n",
+                                            )
+                                            .await;
                                         let _ = writer.flush().await;
                                     } else {
                                         let _ = writer

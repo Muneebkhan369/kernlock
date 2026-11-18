@@ -63,7 +63,43 @@ The extension subscribes to two synchronous authorization events:
 
 ---
 
-## 4. Honest Capability Reporting
+## 4. System Extension Activation & Approval Lifecycle
+
+The real activation lifecycle follows Apple's `SystemExtensions` framework:
+
+1. **Host Application Bundling**:
+   - The `.systemextension` bundle resides inside the container app bundle at:
+     `KernLock.app/Contents/Library/SystemExtensions/com.kernlock.security.dext.systemextension`
+
+2. **Activation Request (`OSSystemExtensionManager`)**:
+   - The host application submits an activation request:
+     ```swift
+     let request = OSSystemExtensionRequest.activationRequest(
+         forExtensionWithIdentifier: "com.kernlock.security.dext",
+         queue: .main
+     )
+     request.delegate = self
+     OSSystemExtensionManager.shared.submitRequest(request)
+     ```
+
+3. **User / MDM Authorization**:
+   - macOS triggers a security prompt: `"System Extension Blocked"`.
+   - The user opens `System Settings -> Privacy & Security -> Security` and clicks **Allow**.
+   - In enterprise fleets, MDM pushes a configuration profile (`com.apple.system-extension.install`) with allowed team identifier and bundle identifier, bypassing the manual user prompt.
+
+4. **Daemon Authentication & Heartbeat Verification**:
+   - Once activated by `launchd`, the extension starts and establishes an authenticated IPC socket connection to `/var/run/kernlock/kernlock.sock`.
+   - It sends an initial `{"action":"heartbeat","client":"endpoint_security","pid":<pid>,"status":"active"}` message and repeats every 5 seconds.
+   - The daemon's `probe_status()` transitions from `NotInstalled` / `AwaitingApproval` to `Active` ONLY after receiving a verified heartbeat.
+   - If the extension stops sending heartbeats for >15 seconds, the daemon marks the status `Failed` (heartbeat expiry).
+
+5. **CI Compilation vs. Real Activation**:
+   - In automated GitHub Actions CI, the C client and `.systemextension` bundle are compiled and validated (checking bundle layout and code sign entitlements).
+   - Real kernel enforcement is **never claimed** on CI runners or unapproved macOS machines; KernLock truthfully reports `Unavailable` or `Degraded` until local user approval and entitlement verification succeed.
+
+---
+
+## 5. Honest Capability Reporting
 
 If the System Extension is not approved, not entitled, or lacks Full Disk Access, `MacOsSecurityProvider` truthfully reports:
 - `kernel_blocking_available = false`

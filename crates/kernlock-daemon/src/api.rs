@@ -32,6 +32,8 @@ struct StatusResponse {
     protection_state: String,
     monitor_health: String,
     state_reason: Option<String>,
+    platform_name: String,
+    enforcement_mechanism: String,
 }
 
 #[derive(Deserialize)]
@@ -214,16 +216,18 @@ async fn health() -> impl IntoResponse {
 async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     let policy = state.engine.get_policy().unwrap_or_default();
     let capabilities = state.engine.capabilities();
-    let (protection_state, monitor_health, state_reason) = state.engine.get_protection_state();
+    let runtime_status = state.engine.runtime_status();
     Json(StatusResponse {
         capabilities,
         policy,
         watcher_active: state.engine.is_watcher_active(),
         fanotify_active: state.engine.is_fanotify_active(),
         rules_loaded: state.engine.rules.rule_count(),
-        protection_state,
-        monitor_health,
-        state_reason,
+        protection_state: runtime_status.protection_state,
+        monitor_health: runtime_status.monitor_health,
+        state_reason: runtime_status.state_reason,
+        platform_name: runtime_status.platform_name,
+        enforcement_mechanism: runtime_status.enforcement_mechanism,
     })
 }
 

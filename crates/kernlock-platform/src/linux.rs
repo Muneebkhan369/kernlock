@@ -2,7 +2,7 @@ use crate::{hostname_string, PlatformError, PlatformSecurityProvider};
 use kernlock_core::analyzer::{aggregate_score, analyze_file_bytes};
 use kernlock_core::models::{
     CapabilityStatus, EventCategory, FileScanResult, PersistenceEntry, PlatformCapabilities,
-    PolicyConfig, ProcessInfo, RuleMatch, SecurityMode, Severity,
+    PlatformRuntimeStatus, PolicyConfig, ProcessInfo, RuleMatch, SecurityMode, Severity,
 };
 use kernlock_core::rules::{RuleEngine, RuleTarget};
 use std::fs;
@@ -236,6 +236,68 @@ impl PlatformSecurityProvider for LinuxSecurityProvider {
             active_mode,
             fallback_reason,
             capabilities,
+        }
+    }
+
+    fn runtime_enforcement_status(&self, requested_mode: SecurityMode) -> PlatformRuntimeStatus {
+        let (health, reason) = crate::fanotify::FanotifyPermissionMonitor::global_health();
+        let probe = crate::fanotify::FanotifyPermissionMonitor::probe_support();
+        let is_root = Self::is_root();
+
+        let (protection_state, monitor_health, state_reason) = match health {
+            crate::fanotify::FanotifyMonitorHealth::Failed => (
+                "Failed".to_string(),
+                "Failed".to_string(),
+                Some(reason.unwrap_or_else(|| "Kernel permission event loop fatal failure".to_string())),
+            ),
+            crate::fanotify::FanotifyMonitorHealth::Degraded => (
+                "Degraded".to_string(),
+                "Degraded".to_string(),
+                Some(reason.unwrap_or_else(|| "Kernel event queue overflowed: some events were dropped; enforcement degraded".to_string())),
+            ),
+            crate::fanotify::FanotifyMonitorHealth::Stopped => (
+                "Degraded".to_string(),
+                "Stopped".to_string(),
+                Some("Kernel permission monitor is stopped".to_string()),
+            ),
+            crate::fanotify::FanotifyMonitorHealth::Running => {
+                if requested_mode == SecurityMode::Audit {
+                    (
+                        "Degraded".to_string(),
+                        "Running".to_string(),
+                        Some("Audit Mode active: observing and logging without active kernel execution blocking.".to_string()),
+                    )
+                } else {
+                    (
+                        "Active".to_string(),
+                        "Running".to_string(),
+                        Some("Kernel execution blocking active and enforcing.".to_string()),
+                    )
+                }
+            }
+            crate::fanotify::FanotifyMonitorHealth::Initialized | crate::fanotify::FanotifyMonitorHealth::Uninitialized => {
+                if !probe.exec_blocking_available || !is_root {
+                    (
+                        "Unavailable".to_string(),
+                        "Unavailable".to_string(),
+                        Some("Kernel execution blocking unavailable (requires root / CAP_SYS_ADMIN)".to_string()),
+                    )
+                } else {
+                    (
+                        "Degraded".to_string(),
+                        "Standby".to_string(),
+                        Some("Kernel execution blocking available; monitor in standby".to_string()),
+                    )
+                }
+            }
+        };
+
+        PlatformRuntimeStatus {
+            protection_state,
+            monitor_health,
+            state_reason,
+            platform_name: "Linux".to_string(),
+            enforcement_mechanism: "fanotify".to_string(),
         }
     }
 

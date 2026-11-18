@@ -91,13 +91,44 @@ KernLockPortConnectNotify (
 
     if (ConnectionContext != NULL && SizeOfContext >= sizeof(KERNLOCK_PORT_CONTEXT)) {
         PKERNLOCK_PORT_CONTEXT ctx = (PKERNLOCK_PORT_CONTEXT)ConnectionContext;
-        g_StrictMode = (ctx->StrictMode != 0) ? 1 : 0;
+        if (ctx->Version == 1) {
+            g_StrictMode = (ctx->StrictMode != 0) ? 1 : 0;
+        } else {
+            g_StrictMode = 0;
+        }
     } else {
         g_StrictMode = 0;
     }
 
     g_ClientPort = ClientPort;
     return STATUS_SUCCESS;
+}
+
+NTSTATUS
+KernLockPortMessageNotify (
+    _In_opt_ PVOID PortCookie,
+    _In_reads_bytes_opt_(InputBufferSize) PVOID InputBuffer,
+    _In_ ULONG InputBufferSize,
+    _Out_writes_bytes_to_opt_(OutputBufferSize, *ReturnOutputBufferLength) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    )
+{
+    UNREFERENCED_PARAMETER(PortCookie);
+    UNREFERENCED_PARAMETER(OutputBuffer);
+    UNREFERENCED_PARAMETER(OutputBufferSize);
+    if (ReturnOutputBufferLength != NULL) {
+        *ReturnOutputBufferLength = 0;
+    }
+
+    if (InputBuffer != NULL && InputBufferSize >= sizeof(KERNLOCK_POLICY_UPDATE_MSG)) {
+        PKERNLOCK_POLICY_UPDATE_MSG msg = (PKERNLOCK_POLICY_UPDATE_MSG)InputBuffer;
+        if (msg->MessageType == 1) {
+            g_StrictMode = (msg->StrictMode != 0) ? 1 : 0;
+            return STATUS_SUCCESS;
+        }
+    }
+    return STATUS_INVALID_PARAMETER;
 }
 
 VOID
@@ -222,6 +253,22 @@ KernLockPreCreate (
             responseMsg.MessageId == requestMsg.Header.MessageId) {
             if (responseMsg.Verdict == VerdictBlock) {
                 // Block execution attempt with ACCESS_DENIED
+                Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                Data->IoStatus.Information = 0;
+                return FLT_PREOP_COMPLETE;
+            } else if (responseMsg.Verdict == VerdictAllow || responseMsg.Verdict == VerdictAudit) {
+                return FLT_PREOP_SUCCESS_NO_CALLBACK;
+            } else {
+                // Unrecognized or invalid verdict: reject in Strict mode
+                if (g_StrictMode) {
+                    Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                    Data->IoStatus.Information = 0;
+                    return FLT_PREOP_COMPLETE;
+                }
+            }
+        } else {
+            // Short reply or MessageId mismatch: reject in Strict mode
+            if (g_StrictMode) {
                 Data->IoStatus.Status = STATUS_ACCESS_DENIED;
                 Data->IoStatus.Information = 0;
                 return FLT_PREOP_COMPLETE;
@@ -355,6 +402,22 @@ KernLockPreAcquireForSectionSynchronization (
                 Data->IoStatus.Status = STATUS_ACCESS_DENIED;
                 Data->IoStatus.Information = 0;
                 return FLT_PREOP_COMPLETE;
+            } else if (responseMsg.Verdict == VerdictAllow || responseMsg.Verdict == VerdictAudit) {
+                return FLT_PREOP_SUCCESS_NO_CALLBACK;
+            } else {
+                // Unrecognized or invalid verdict: reject in Strict mode
+                if (g_StrictMode) {
+                    Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                    Data->IoStatus.Information = 0;
+                    return FLT_PREOP_COMPLETE;
+                }
+            }
+        } else {
+            // Short reply or MessageId mismatch: reject in Strict mode
+            if (g_StrictMode) {
+                Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                Data->IoStatus.Information = 0;
+                return FLT_PREOP_COMPLETE;
             }
         }
     } else if (status == STATUS_TIMEOUT || !NT_SUCCESS(status)) {
@@ -426,7 +489,7 @@ DriverEntry (
                                         NULL,
                                         KernLockPortConnectNotify,
                                         KernLockPortDisconnectNotify,
-                                        NULL,
+                                        KernLockPortMessageNotify,
                                         1);
 
     FltFreeSecurityDescriptor(sd);

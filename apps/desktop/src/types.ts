@@ -99,6 +99,8 @@ export interface SystemStatus {
   protection_state?: "Active" | "Degraded" | "Failed" | "Unavailable";
   monitor_health?: string;
   state_reason?: string | null;
+  platform_name?: string;
+  enforcement_mechanism?: string;
 }
 
 export interface ProcessInfo {

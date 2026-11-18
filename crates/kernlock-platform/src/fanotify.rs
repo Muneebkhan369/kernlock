@@ -791,10 +791,25 @@ impl FanotifyPermissionMonitor {
         if self.is_running.swap(false, Ordering::SeqCst) {
             self.set_health(FanotifyMonitorHealth::Stopped, None);
             #[cfg(target_os = "linux")]
-            unsafe {
-                libc::close(self.fanotify_fd);
+            if self.fanotify_fd >= 0 {
+                unsafe {
+                    libc::close(self.fanotify_fd);
+                }
             }
             info!("fanotify permission monitor stopped");
+        }
+    }
+
+    pub fn new_mock(health: FanotifyMonitorHealth, is_running: bool) -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            fanotify_fd: -1,
+            health: Arc::new(RwLock::new(health)),
+            health_reason: Arc::new(RwLock::new(None)),
+            is_running: Arc::new(AtomicBool::new(is_running)),
+            exec_blocking_supported: Arc::new(AtomicBool::new(true)),
+            monitored_mounts: Arc::new(RwLock::new(vec!["/".to_string()])),
+            unmonitored_mounts: Arc::new(RwLock::new(Vec::new())),
         }
     }
 }

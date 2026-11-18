@@ -1,6 +1,6 @@
 use kernlock_core::{
-    FileScanResult, PersistenceEntry, PlatformCapabilities, PolicyConfig, ProcessInfo, RuleEngine,
-    SecurityMode,
+    FileScanResult, PersistenceEntry, PlatformCapabilities, PlatformRuntimeStatus, PolicyConfig,
+    ProcessInfo, RuleEngine, SecurityMode,
 };
 use std::path::Path;
 use thiserror::Error;
@@ -20,6 +20,8 @@ pub enum PlatformError {
 
 pub trait PlatformSecurityProvider: Send + Sync {
     fn probe_capabilities(&self, requested_mode: SecurityMode) -> PlatformCapabilities;
+    fn runtime_enforcement_status(&self, requested_mode: SecurityMode) -> PlatformRuntimeStatus;
+    fn record_heartbeat(&self, _client: &str, _pid: i32, _status: &str) {}
     fn list_processes(
         &self,
         rules: &RuleEngine,
